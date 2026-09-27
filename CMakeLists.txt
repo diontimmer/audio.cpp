@@ -432,6 +432,7 @@ add_library(engine_core OBJECT
     src/framework/assets/tensor_source.cpp
     src/framework/assets/weight_norm_folding.cpp
     src/framework/assets/lora_tensor_source.cpp
+    src/framework/assets/lora_adapter.cpp
     src/framework/assets/torch_bin.cpp
     src/framework/core/module.cpp
     src/framework/core/backend.cpp
@@ -3014,6 +3015,8 @@ if (ENGINE_BUILD_TESTS OR ENGINE_BUILD_EXTENDED_TESTS OR ENGINE_BUILD_MODEL_TEST
         add_engine_unittest(gguf_tensor_source_test tests/unittests/test_gguf_tensor_source.cpp)
         target_include_directories(gguf_tensor_source_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tests/unittests)
         add_test(NAME gguf_tensor_source_test COMMAND gguf_tensor_source_test)
+        add_engine_unittest(lora_adapter_test tests/unittests/test_lora_adapter.cpp)
+        add_test(NAME lora_adapter_test COMMAND lora_adapter_test)
         add_engine_unittest(lora_tensor_source_test tests/unittests/test_lora_tensor_source.cpp)
         add_test(NAME lora_tensor_source_test COMMAND lora_tensor_source_test --log)
 

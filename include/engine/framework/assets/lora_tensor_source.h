@@ -11,6 +11,8 @@ enum class LoraMergeMode {
     RoundedBF16Delta,
 };
 
+enum class LoraNormalization { None, Rows, Columns };
+
 struct LoraTensorDelta {
     std::vector<float> a;
     std::vector<float> b;
@@ -19,6 +21,12 @@ struct LoraTensorDelta {
     int64_t out = 0;
     float scale = 1.0F;
     LoraMergeMode merge_mode = LoraMergeMode::AccumulateF32;
+    // DoRA computes a full-strength direction, normalizes it, then interpolates
+    // from the original weight. Scaling B before normalization is not equivalent.
+    LoraNormalization normalization = LoraNormalization::None;
+    std::vector<float> magnitude;
+    float strength = 1.0F;
+    float norm_epsilon = 0.0F;
 };
 
 struct TensorOverride {
@@ -26,7 +34,7 @@ struct TensorOverride {
     std::vector<float> values;
 };
 
-// Shapes are A=[rank,in], B=[out,rank], base=[out,in]. Names and the resolved
+// Shapes are A=[rank,in], B=[out,rank], base=[out,in] (or a Conv1d flattened across its input/kernel axes). Names and the resolved
 // scale come from the model; this helper does not interpret adapter metadata.
 LoraTensorDelta load_lora_tensor_delta(
     const TensorSource & base, const TensorSource & adapter,

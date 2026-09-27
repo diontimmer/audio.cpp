@@ -200,7 +200,7 @@ StableAudioSession::StableAudioSession(
         mem_saver_ = runtime::parse_bool_option(*mem_saver, "stable_audio.mem_saver");
     }
     for (const auto & [key, value] : this->options().options) {
-        if (key == "stable_audio.max_batch" || key == "stable_audio.weight_type" || key == "stable_audio.mem_saver") {
+        if (key == "stable_audio.lora" || key == "stable_audio.lora_strength" || key == "stable_audio.max_batch" || key == "stable_audio.weight_type" || key == "stable_audio.mem_saver") {
             (void) value;
             continue;
         }
