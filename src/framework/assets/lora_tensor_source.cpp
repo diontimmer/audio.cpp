@@ -4,6 +4,8 @@
 #include "engine/framework/debug/trace.h"
 
 #include <chrono>
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -16,6 +18,16 @@ namespace {
 constexpr int64_t kParallelLoraMergeWorkItems = 1ll << 20;
 #endif
 
+bool matches_matrix(const std::vector<int64_t> & shape, int64_t out, int64_t in) {
+    if (shape.size() < 2 || shape.size() > 3 || shape[0] != out || out <= 0 || in <= 0) return false;
+    int64_t columns = 1;
+    for (size_t i = 1; i < shape.size(); ++i) {
+        if (shape[i] <= 0 || columns > std::numeric_limits<int64_t>::max() / shape[i]) return false;
+        columns *= shape[i];
+    }
+    return columns == in;
+}
+
 struct LoraMergeResult {
     std::vector<float> values;
     double base_read_ms = 0.0;
@@ -27,9 +39,10 @@ LoraMergeResult merged_f32_values(
     const std::string & name,
     const LoraTensorDelta & delta) {
     const auto base_read_started = std::chrono::steady_clock::now();
-    auto values = base.require_f32(name, std::optional<std::vector<int64_t>>({delta.out, delta.in}));
+    auto values = base.require_f32(name);
     const double base_read_ms = engine::debug::elapsed_ms(base_read_started);
     // values[o, i] += scale * sum_k B[o, k] * A[k, i]
+    const auto original = delta.normalization == LoraNormalization::None ? std::vector<float>{} : values;
     const auto compute_started = std::chrono::steady_clock::now();
     if (delta.merge_mode == LoraMergeMode::RoundedBF16Delta) {
         std::vector<float> product(values.size(), 0.0F);
@@ -68,6 +81,29 @@ LoraMergeResult merged_f32_values(
             }
         }
     }
+    if (delta.normalization != LoraNormalization::None) {
+        const bool rows = delta.normalization == LoraNormalization::Rows;
+        std::vector<double> norms(static_cast<size_t>(rows ? delta.out : delta.in), 0.0);
+        for (int64_t o = 0; o < delta.out; ++o)
+            for (int64_t i = 0; i < delta.in; ++i) {
+                const double v = values[static_cast<size_t>(o * delta.in + i)];
+                norms[static_cast<size_t>(rows ? o : i)] += v * v;
+            }
+        for (size_t j = 0; j < norms.size(); ++j) {
+            norms[j] = std::sqrt(norms[j]) + delta.norm_epsilon;
+            if (!(norms[j] > 0.0) || !std::isfinite(norms[j]))
+                throw std::runtime_error("DoRA direction has an invalid norm: " + name);
+        }
+        for (int64_t o = 0; o < delta.out; ++o)
+            for (int64_t i = 0; i < delta.in; ++i) {
+                const auto offset = static_cast<size_t>(o * delta.in + i);
+                const auto axis = static_cast<size_t>(rows ? o : i);
+                const float merged = static_cast<float>(values[offset] * (delta.magnitude[axis] / norms[axis]));
+                values[offset] = original[offset] + delta.strength * (merged - original[offset]);
+            }
+    }
+    if (!std::all_of(values.begin(), values.end(), [](float v) { return std::isfinite(v); }))
+        throw std::runtime_error("LoRA merge produced non-finite weights: " + name);
     return LoraMergeResult{std::move(values), base_read_ms, engine::debug::elapsed_ms(compute_started)};
 }
 
@@ -145,7 +181,7 @@ public:
             base_->set_backend_tensor(tensor, name, storage_type, expected_shape);
             return;
         }
-        if (expected_shape != std::vector<int64_t>({delta->second.out, delta->second.in})) {
+        if (expected_shape != base_->require_metadata(name).shape) {
             throw std::runtime_error("tensor shape mismatch for " + key);
         }
         std::unique_lock<std::mutex> lock(upload_cache_mutex_, std::defer_lock);
@@ -340,7 +376,7 @@ LoraTensorDelta load_lora_tensor_delta(
     if (b_meta.shape[1] != delta.r) {
         throw std::runtime_error("LoRA A/B rank mismatch for " + base_name);
     }
-    if (base.require_metadata(base_name).shape != std::vector<int64_t>({delta.out, delta.in})) {
+    if (!matches_matrix(base.require_metadata(base_name).shape, delta.out, delta.in)) {
         throw std::runtime_error(
             "LoRA shape mismatch for " + base_name + " (adapter is trained for a different model size)");
     }
@@ -367,7 +403,18 @@ std::shared_ptr<const TensorSource> make_lora_tensor_source(
             delta.b.size() % delta.r != 0 || delta.b.size() / delta.r != static_cast<size_t>(delta.out)) {
             throw std::runtime_error("LoRA A/B dimensions or values mismatch for " + name);
         }
-        require_tensor_shape(*base, name, {delta.out, delta.in});
+        if (!matches_matrix(base->require_metadata(name).shape, delta.out, delta.in))
+            throw std::runtime_error("LoRA base shape mismatch for " + name);
+        const auto finite = [](float v) { return std::isfinite(v); };
+        if (!finite(delta.scale) || !finite(delta.strength) || !finite(delta.norm_epsilon) || delta.norm_epsilon < 0 ||
+            !std::all_of(delta.a.begin(), delta.a.end(), finite) ||
+            !std::all_of(delta.b.begin(), delta.b.end(), finite) ||
+            !std::all_of(delta.magnitude.begin(), delta.magnitude.end(), finite))
+            throw std::runtime_error("LoRA contains non-finite values for " + name);
+        if (delta.normalization != LoraNormalization::None &&
+            (delta.merge_mode != LoraMergeMode::AccumulateF32 ||
+             delta.magnitude.size() != static_cast<size_t>(delta.normalization == LoraNormalization::Rows ? delta.out : delta.in)))
+            throw std::runtime_error("DoRA magnitude shape or merge mode mismatch for " + name);
     }
     for (const auto & [name, tensor] : overrides) {
         require_tensor_shape(*base, name, tensor.shape);

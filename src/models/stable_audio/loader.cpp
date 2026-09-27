@@ -4,6 +4,9 @@
 #include "engine/models/stable_audio/foundation/session.h"
 #include "engine/models/stable_audio/session.h"
 
+#include "engine/framework/assets/lora_adapter.h"
+#include "engine/framework/runtime/options.h"
+
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -61,6 +64,8 @@ runtime::ModelCliInterface cli(const StableAudioAssets &) {
         {"seed", "n", "Torch RNG seed."},
     };
     out.session_options = {
+        {"stable_audio.lora", "path", "SafeTensors LoRA/DoRA adapter; immutable for this session."},
+        {"stable_audio.lora_strength", "0..10", "Adapter strength multiplied by alpha/r; default 1, zero disables."},
         {"stable_audio.max_batch", "n", "Maximum prompt batch size; default 1."},
         {"stable_audio.weight_type", "native|f32|f16|bf16|q8_0", "Stable Audio weight storage type."},
         {"stable_audio.mem_saver", "true|false", "Release staged runtime graphs after each request; default false."},
@@ -147,9 +152,27 @@ std::unique_ptr<runtime::IVoiceTaskSession> StableAudioLoadedModel::create_task_
         throw std::runtime_error("Stable Audio supports only the gen task");
     }
     if (assets_->config.stable_audio_open_v1) {
+        if (options.options.count("stable_audio.lora") || options.options.count("stable_audio.lora_strength"))
+            throw std::runtime_error("Stable Audio adapters currently require Stable Audio 3, not Foundation/Open");
         return std::make_unique<foundation::FoundationSession>(task, options, assets_);
     }
-    return std::make_unique<StableAudioSession>(task, options, assets_);
+    auto session_assets = assets_;
+    const auto adapter = runtime::find_option(options.options, {"stable_audio.lora"});
+    const auto strength = runtime::parse_finite_float_option(options.options, {"stable_audio.lora_strength"});
+    if (strength && !adapter) throw std::runtime_error("stable_audio.lora_strength requires stable_audio.lora");
+    if (adapter) {
+        if (adapter->empty()) throw std::runtime_error("stable_audio.lora path must not be empty");
+        auto adapted = std::make_shared<StableAudioAssets>(*assets_);
+        engine::assets::LoraAdapterOptions adapter_options;
+        adapter_options.strength = strength.value_or(1.0F);
+        adapter_options.native_parametrizations = true;
+        adapter_options.target_prefixes = {"", "model.", "model.model.", "conditioner."};
+        adapter_options.allowed_target_prefixes = {"model.model.", "conditioner.conditioners.seconds_total."};
+        adapter_options.log_prefix = "stable_audio.lora";
+        adapted->model_weights = engine::assets::make_lora_adapter_source(assets_->model_weights, *adapter, adapter_options);
+        session_assets = std::move(adapted);
+    }
+    return std::make_unique<StableAudioSession>(task, options, std::move(session_assets));
 }
 
 std::unique_ptr<StableAudioLoadedModel> load_stable_audio_model(const std::filesystem::path & model_path) {

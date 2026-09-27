@@ -1,0 +1,27 @@
+name: LoRA adapters
+on:
+  push:
+    branches: [feature/music-lora]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  adapter-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure CPU adapter tests
+        run: >-
+          cmake -S . -B build-lora -DCMAKE_BUILD_TYPE=Release
+          -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=stable_audio,ace_step
+          -DENGINE_BUILD_TESTS=ON -DENGINE_ENABLE_METAL=OFF
+          -DENGINE_ENABLE_CUDA=OFF -DENGINE_ENABLE_NATIVE_CPU=OFF
+          -DENGINE_ENABLE_OPENMP=OFF -DGGML_OPENMP=OFF
+      - name: Build
+        run: cmake --build build-lora --config Release --target lora_adapter_test lora_tensor_source_test --parallel 3
+      - name: Test
+        run: ctest --test-dir build-lora -C Release -R "lora_(adapter|tensor_source)_test" --output-on-failure

@@ -146,6 +146,12 @@ void run(const std::filesystem::path & root) {
     for (auto type : {assets::TensorStorageType::F32, assets::TensorStorageType::F16,
                       assets::TensorStorageType::BF16, assets::TensorStorageType::Q8_0,
                       assets::TensorStorageType::Q4_0}) {
+        auto dora_delta = delta;
+        dora_delta.normalization = assets::LoraNormalization::Rows;
+        dora_delta.magnitude = {2.0F, 3.0F};
+        dora_delta.strength = 0.4F;
+        auto dora = assets::make_lora_tensor_source(base, {{"weight", dora_delta}});
+        check_upload(*dora, "weight", {2, 32}, type);
         check_upload(*overlay, "weight", {2, 32}, type);
         check_upload(*rounded, "weight", {2, 32}, type);
         check_upload(*overlay, "untouched", {2, 32}, type);
