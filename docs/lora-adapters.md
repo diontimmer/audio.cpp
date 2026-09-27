@@ -2,7 +2,7 @@
 
 This fork adds native, session-scoped LoRA loading for Stable Audio 3 and
 ACE-Step 1.5. Python and model conversion are not required at inference time.
-Base model files are never modified. One adapter can be selected per session.
+Base model files are never modified. Up to eight adapters can be selected per session.
 
 ## Supported formats
 
@@ -19,7 +19,7 @@ alpha/r (or alpha/sqrt(r)) are multiplied by the user's strength. For DoRA,
 strength interpolates between the original weight and the **fully normalized**
 merged weight; it does not scale the low-rank update before normalization.
 
-Unsupported configurations fail with an error: LoRA-XS, BoRA, LoKR, stacking,
+Unsupported configurations fail with an error: LoRA-XS, BoRA, LoKR,
 step-dependent schedules, transpose/fan-in-fan-out PEFT layers, trained biases,
 per-module rank/alpha patterns, replicated layers, saved full modules, and
 non-SafeTensors checkpoints. ACE-Step encoder/planner/VAE adapters and Stable
@@ -54,7 +54,7 @@ strength without an adapter is an error. Changing adapters/strength requires a
 new session, which may reuse the same loaded base model. Adapted weights belong
 to that session; other sessions retain their own weights.
 
-C API callers use `audiocpp_options_create/set` to populate the same two keys,
+C API callers use `audiocpp_options_create/set` to populate the legacy keys or the stack key,
 then pass the options to `audiocpp_session_create`. No ABI extension is required.
 Never perform model/session creation, adapter reads, merges, or destruction on
 an audio callback. Applications should snapshot adapter bytes and config before
@@ -66,6 +66,30 @@ conversion; this is not numerically equivalent to merging the original
 unquantized weights and then quantizing. Strength zero bypasses this issue.
 DoRA temporarily needs the original and merged tensor plus norm scratch space;
 this is allocated per adapted weight, not as a second complete base model.
+
+## Ordered stacks
+
+Pass `stable_audio.adapters` or `ace_step.adapters` as a JSON array:
+
+```json
+[{"path":"/adapters/texture.safetensors","strength":0.6},
+ {"path":"/adapters/attack.safetensors","strength":0.3}]
+```
+
+The list replaces the legacy `.lora` / `.lora_strength` keys; combining the two
+forms is an error. At most eight entries are accepted. Strength defaults to 1.
+An empty list returns the base source. Every entry, including zero-strength
+entries, must be valid. Zero entries return the preceding source unchanged.
+
+Apply entries from top to bottom. Plain LoRA adds each scaled delta to the
+preceding result. DoRA computes its direction and magnitude normalization using
+the preceding result as its base, then interpolates by its strength. Therefore
+mixed/DoRA stacks are order dependent. This is explicitly sequential merge
+semantics, not a claim of equivalence with simultaneous PEFT DoRA composition.
+Changing order requires a new session. Intermediate overlays use F32 without
+repeated backend quantization; the final upload chooses the storage type.
+Memory for adapter factors grows with the stack; merge work is performed off the
+audio thread. One bad entry fails session creation; no partial stack is used.
 
 ## Validation
 
