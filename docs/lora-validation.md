@@ -30,6 +30,16 @@ and elapsed time for baseline, enabled, reused, base-after-enabled, and disabled
 runs. Exact hashes are only assertions within this host/backend; other GPU
 backends are not required to generate identical audio.
 
+The native Goa adapter's card names **Medium Base**, while the available GGUF
+used for this test is **Medium**. Its successful run establishes tensor routing
+and adapter application, not training-checkpoint identity or listening quality.
+A second Stable Audio integration run uses the [Maqam PEFT adapter](https://huggingface.co/motiftechnologies/stable-audio-3-maqam-lora/tree/3e1d9aa6fcb72a619b4ced00a240c5039f76daf0),
+whose config identifies the Medium checkpoint. All five C API checks also pass
+for that adapter (rank 64, alpha 128); see `stable-audio-peft-metal.json`.
+
+A deliberate Medium-on-Small attempt fails with a tensor shape mismatch before
+inference, rather than applying a partial adapter.
+
 ## Coverage boundaries
 
 - LoRA/DoRA math, legacy DoRA magnitude layout, malformed-file rejection,

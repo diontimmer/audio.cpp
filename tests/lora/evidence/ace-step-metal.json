@@ -1,0 +1,57 @@
+{
+  "family": "ace_step",
+  "backend": "metal",
+  "passed": true,
+  "runs": [
+    {
+      "label": "baseline",
+      "seconds": 15.05318020802224,
+      "duration": 8.0,
+      "frames": 384000,
+      "sample_rate": 48000,
+      "channels": 2,
+      "peak": 1.1007472276687622,
+      "sha256": "25e25211904523a908a302f448953df0e9b85a2a489ba5741b5eb38f29d56ec6"
+    },
+    {
+      "label": "adapted",
+      "seconds": 24.514702124986798,
+      "duration": 8.0,
+      "frames": 384000,
+      "sample_rate": 48000,
+      "channels": 2,
+      "peak": 0.591995358467102,
+      "sha256": "599da6960583d58c480c0237a956eb11ee1c852ee393e2302fd0d7ddb77da0d0"
+    },
+    {
+      "label": "adapted_reuse",
+      "seconds": 14.578394083015155,
+      "duration": 8.0,
+      "frames": 384000,
+      "sample_rate": 48000,
+      "channels": 2,
+      "peak": 0.591995358467102,
+      "sha256": "599da6960583d58c480c0237a956eb11ee1c852ee393e2302fd0d7ddb77da0d0"
+    },
+    {
+      "label": "baseline_after_adapter",
+      "seconds": 12.861342167016119,
+      "duration": 8.0,
+      "frames": 384000,
+      "sample_rate": 48000,
+      "channels": 2,
+      "peak": 1.1007472276687622,
+      "sha256": "25e25211904523a908a302f448953df0e9b85a2a489ba5741b5eb38f29d56ec6"
+    },
+    {
+      "label": "zero_strength",
+      "seconds": 20.73579066694947,
+      "duration": 8.0,
+      "frames": 384000,
+      "sample_rate": 48000,
+      "channels": 2,
+      "peak": 1.1007472276687622,
+      "sha256": "25e25211904523a908a302f448953df0e9b85a2a489ba5741b5eb38f29d56ec6"
+    }
+  ]
+}

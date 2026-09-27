@@ -17,7 +17,7 @@ jobs:
       - name: Configure CPU adapter tests
         run: >-
           cmake -S . -B build-lora -DCMAKE_BUILD_TYPE=Release
-          -DAUDIOCPP_MODEL_SET=custom -DAUDIOCPP_MODELS=stable_audio,ace_step
+          -DAUDIOCPP_MODEL_SET=custom "-DAUDIOCPP_MODELS=stable_audio,ace_step"
           -DENGINE_BUILD_TESTS=ON -DENGINE_ENABLE_METAL=OFF
           -DENGINE_ENABLE_CUDA=OFF -DENGINE_ENABLE_NATIVE_CPU=OFF
           -DENGINE_ENABLE_OPENMP=OFF -DGGML_OPENMP=OFF
