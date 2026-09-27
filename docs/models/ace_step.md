@@ -1,6 +1,5 @@
 # ACE-Step
 
-
 This fork supports session-scoped LoRA/DoRA adapters; see [formats, strength controls and validation](../lora-adapters.md).
 
 ACE-Step is wired as `--family ace_step --task gen`. It generates and edits music from text, lyrics, and optional source audio. The route controls whether source audio is ignored, optional, or required.
