@@ -1,0 +1,57 @@
+{
+  "family": "stable_audio",
+  "backend": "metal",
+  "passed": true,
+  "runs": [
+    {
+      "label": "baseline",
+      "seconds": 1.5001195420045406,
+      "duration": 4.0,
+      "frames": 176400,
+      "sample_rate": 44100,
+      "channels": 2,
+      "peak": 0.9425177574157715,
+      "sha256": "745f6b2aa6e05de1966c198c7caece84c8c78d605f05804212fed11465d81f12"
+    },
+    {
+      "label": "adapted",
+      "seconds": 2.8016442080261186,
+      "duration": 4.0,
+      "frames": 176400,
+      "sample_rate": 44100,
+      "channels": 2,
+      "peak": 0.9781920313835144,
+      "sha256": "81537cdc9682bc48dc194baed577d17b8a9b2c452fd06b12a564334f239cab80"
+    },
+    {
+      "label": "adapted_reuse",
+      "seconds": 0.5836586249643005,
+      "duration": 4.0,
+      "frames": 176400,
+      "sample_rate": 44100,
+      "channels": 2,
+      "peak": 0.9781920313835144,
+      "sha256": "81537cdc9682bc48dc194baed577d17b8a9b2c452fd06b12a564334f239cab80"
+    },
+    {
+      "label": "baseline_after_adapter",
+      "seconds": 0.5926862920168787,
+      "duration": 4.0,
+      "frames": 176400,
+      "sample_rate": 44100,
+      "channels": 2,
+      "peak": 0.9425177574157715,
+      "sha256": "745f6b2aa6e05de1966c198c7caece84c8c78d605f05804212fed11465d81f12"
+    },
+    {
+      "label": "zero_strength",
+      "seconds": 0.9297387920087203,
+      "duration": 4.0,
+      "frames": 176400,
+      "sample_rate": 44100,
+      "channels": 2,
+      "peak": 0.9425177574157715,
+      "sha256": "745f6b2aa6e05de1966c198c7caece84c8c78d605f05804212fed11465d81f12"
+    }
+  ]
+}

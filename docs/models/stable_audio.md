@@ -1,5 +1,7 @@
 # Stable Audio
 
+This fork supports session-scoped LoRA/DoRA adapters; see [formats, strength controls and validation](../lora-adapters.md).
+
 Stable Audio is wired as `--family stable_audio --task gen`. It generates music or sound effects from text, and the music model can condition generation on input audio for init-audio or inpainting workflows.
 
 ## Stable Audio 3 Small Music
