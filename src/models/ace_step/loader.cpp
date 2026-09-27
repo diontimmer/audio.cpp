@@ -86,6 +86,7 @@ runtime::ModelCliInterface cli(const AceStepAssets &) {
     };
     out.session_options = {
         {"ace_step.lora", "path", "SafeTensors LoRA/DoRA adapter; immutable for this session."},
+        {"ace_step.adapters", "JSON", "Ordered array of up to eight path/strength entries; LoRA adds, DoRA normalizes in list order."},
         {"ace_step.lora_strength", "0..10", "Adapter strength multiplied by alpha/r; default 1, zero disables."},
         {"ace_step.weight_type", "native|f32|f16|bf16|q8_0", "Shared ACE-Step weight storage type."},
         {"ace_step.dit_weight_type", "native|f32|f16|bf16|q8_0", "DiT weight storage type; f16 is promoted to bf16."},
@@ -181,11 +182,13 @@ std::unique_ptr<runtime::IVoiceTaskSession> AceStepLoadedModel::create_task_sess
         throw std::runtime_error("ACE-Step supports only offline mode");
     }
     auto session_assets = assets_;
+    const auto stack = runtime::find_option(options.options, {"ace_step.adapters"});
     const auto adapter = runtime::find_option(options.options, {"ace_step.lora"});
     const auto strength = runtime::parse_finite_float_option(options.options, {"ace_step.lora_strength"});
     if (strength && !adapter) throw std::runtime_error("ace_step.lora_strength requires ace_step.lora");
-    if (adapter) {
-        if (adapter->empty()) throw std::runtime_error("ace_step.lora path must not be empty");
+    if (stack && (adapter || strength)) throw std::runtime_error("Do not combine ace_step.adapters with legacy lora options");
+    if (adapter || stack) {
+        if (adapter && adapter->empty()) throw std::runtime_error("ace_step.lora path must not be empty");
         auto adapted = std::make_shared<AceStepAssets>(*assets_);
         engine::assets::LoraAdapterOptions adapter_options;
         adapter_options.strength = strength.value_or(1.0F);
@@ -193,7 +196,9 @@ std::unique_ptr<runtime::IVoiceTaskSession> AceStepLoadedModel::create_task_sess
         adapter_options.target_prefixes = {"", "decoder."};
         adapter_options.allowed_target_prefixes = {"decoder."};
         adapter_options.log_prefix = "ace_step.lora";
-        adapted->dit_weights = engine::assets::make_lora_adapter_source(assets_->dit_weights, *adapter, adapter_options);
+        adapted->dit_weights = stack
+            ? engine::assets::make_lora_adapter_stack_source(assets_->dit_weights, *stack, adapter_options)
+            : engine::assets::make_lora_adapter_source(assets_->dit_weights, *adapter, adapter_options);
         session_assets = std::move(adapted);
     }
     return std::make_unique<AceStepSession>(task, options, std::move(session_assets));

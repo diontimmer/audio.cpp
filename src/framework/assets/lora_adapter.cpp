@@ -179,4 +179,26 @@ std::shared_ptr<const TensorSource> make_lora_adapter_source(
         "validated " + std::to_string(layers.size()) + " " + type + " modules, strength=" + std::to_string(options.strength));
     return options.strength == 0.0F ? base : result;
 }
+std::shared_ptr<const TensorSource> make_lora_adapter_stack_source(
+    std::shared_ptr<const TensorSource> base, const std::string & text,
+    const LoraAdapterOptions & options) {
+    if (!base) throw std::runtime_error("Adapter stack requires a base tensor source");
+    if (text.size() > 65536) throw std::runtime_error("Adapter stack JSON is too large");
+    const auto entries = json::parse(text);
+    if (!entries.is_array() || entries.as_array().size() > 8)
+        throw std::runtime_error("Adapter stack must be an array with at most eight entries");
+    auto result = base;
+    for (const auto & entry : entries.as_array()) {
+        if (!entry.is_object()) throw std::runtime_error("Adapter entry must be an object");
+        for (const auto & field : entry.as_object())
+            if (field.first != "path" && field.first != "strength")
+                throw std::runtime_error("Unknown adapter field: " + field.first);
+        const auto path = json::require_string(entry, "path");
+        if (path.empty()) throw std::runtime_error("Adapter path must not be empty");
+        auto current = options;
+        current.strength = number(entry, "strength", 1.0F);
+        result = make_lora_adapter_source(result, std::filesystem::u8path(path), current);
+    }
+    return result;
+}
 } // namespace engine::assets

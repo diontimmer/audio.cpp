@@ -1,5 +1,6 @@
 #include "engine/framework/assets/lora_adapter.h"
 #include "engine/framework/io/safetensors.h"
+#include "engine/framework/io/json.h"
 #include "test_assert.h"
 
 #include <chrono>
@@ -64,6 +65,27 @@ void run(const std::filesystem::path & root) {
     near(overlay->require_f32(base_name),expected); // repeated reads must not accumulate
     near(base->require_f32(base_name),w);
     require(overlay->require_tensor_data("untouched").bytes==base->require_tensor_data("untouched").bytes,"unadapted weight changed");
+    auto stack_json = [&](const std::vector<std::pair<std::filesystem::path,float>>& items) {
+        io::json::Value::Array list;
+        for (const auto& item : items) list.push_back(io::json::Value::make_object({
+            {"path",io::json::Value::make_string(item.first.u8string())},
+            {"strength",io::json::Value::make_number(item.second)}}));
+        return io::json::stringify(io::json::Value::make_array(std::move(list)));
+    };
+    auto stacked = assets::make_lora_adapter_stack_source(base,stack_json({{root,.25F},{root,.5F}}),peft);
+    auto sum_expected = w;
+    for(size_t i=0;i<w.size();++i) sum_expected[i] += 1.5F*(expected[i]-w[i]);
+    near(stacked->require_f32(base_name),sum_expected);
+    near(stacked->require_f32(base_name),sum_expected);
+    near(base->require_f32(base_name),w);
+    require(assets::make_lora_adapter_stack_source(base,"[]",peft).get()==base.get(),"empty stack bypass");
+    require(assets::make_lora_adapter_stack_source(base,stack_json({{root,0},{root,0}}),peft).get()==base.get(),"zero stack bypass");
+    rejects([&]{assets::make_lora_adapter_stack_source(base,"{}",peft);},"array");
+    rejects([&]{assets::make_lora_adapter_stack_source(base,stack_json(std::vector<std::pair<std::filesystem::path,float>>(9,{root,1})),peft);},"eight");
+    rejects([&]{assets::make_lora_adapter_stack_source(base,R"([{"path":"x","enabled":true}])",peft);},"Unknown adapter field");
+    const auto plain_root=root/"plain";
+    std::filesystem::create_directories(plain_root);
+    write(plain_root/"adapter_model.safetensors",entries);config(plain_root,plain);
     peft.strength=0;
     require(assets::make_lora_adapter_source(base,root,peft).get()==base.get(),"zero strength must bypass conversion");
     peft.strength=.5F;
@@ -81,6 +103,21 @@ void run(const std::filesystem::path & root) {
         for(size_t i=0;i<3;++i) { const auto j=o*3+i; dora_expected[j]=w[j]+.5F*((w[j]+2*(expected[j]-w[j]))*(o+2)/std::sqrt(sum)-w[j]); }
     }
     near(dora,dora_expected);
+    // DoRA uses the preceding result as its base: order must be explicit and stable.
+    auto mixed_expected = expected;
+    for(size_t o=0;o<2;++o) {
+        double norm=0;
+        for(size_t i=0;i<3;++i) { auto j=o*3+i; double v=expected[j]+2*(expected[j]-w[j]);norm+=v*v; }
+        for(size_t i=0;i<3;++i) { auto j=o*3+i;
+            mixed_expected[j]=expected[j]+.5F*((expected[j]+2*(expected[j]-w[j]))*(o+2)/std::sqrt(norm)-expected[j]); }
+    }
+    auto mixed=assets::make_lora_adapter_stack_source(base,stack_json({{plain_root,.5F},{root,.5F}}),peft);
+    near(mixed->require_f32(base_name),mixed_expected);
+    auto reversed_expected=dora_expected;
+    for(size_t i=0;i<w.size();++i) reversed_expected[i]+=expected[i]-w[i];
+    near(assets::make_lora_adapter_stack_source(base,stack_json({{root,.5F},{plain_root,.5F}}),peft)->require_f32(base_name),reversed_expected);
+    require(std::abs(mixed_expected[0]-reversed_expected[0])>.1F,"DoRA stack order must affect result");
+    near(base->require_f32(base_name),w);
     entries.pop_back();write(root/"adapter_model.safetensors",entries);
     rejects([&]{assets::make_lora_adapter_source(base,root,peft);},"missing magnitude");
     config(root,R"({"peft_type":"LORA","r":2,"rank_pattern":{"x":1}})");

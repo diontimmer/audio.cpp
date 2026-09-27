@@ -51,5 +51,14 @@ inference, rather than applying a partial adapter.
   Stable Audio adapter used here is specifically for Medium.
 - CUDA inference and Windows DAW/plugin integration are not validated by these
   Mac tests. The fork has CPU adapter-test CI for Linux, macOS, and Windows.
-- LoRA-XS, BoRA, LoKR, adapter stacking, and per-step strength schedules are
+- LoRA-XS, BoRA, LoKR, and per-step strength schedules are
   explicitly unsupported in this first implementation.
+
+## Ordered stacking
+
+The native adapter unit test additionally covers two overlapping LoRA entries
+with independent strengths, exact empty/all-zero bypass, repeated reads, base
+isolation, stack limits/malformed fields, and mixed LoRA/DoRA stacks in both
+orders against independently calculated expected weights. These tests pass on
+Metal-capable macOS locally; real stacked inference evidence is tracked by the
+VST.cpp integration tests. This does not establish trained DoRA audio quality.
