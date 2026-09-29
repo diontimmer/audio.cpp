@@ -1226,3 +1226,56 @@ audiocpp_status audiocpp_event_voice_activity(const audiocpp_event * event,
     if (out_probability != nullptr) *out_probability = activity.probability;
     return AUDIOCPP_OK;
 }
+
+const char * audiocpp_list_devices_json(void) {
+    thread_local std::string g_devices_json;
+    try {
+        g_devices_json.clear();
+        const auto devices = engine::core::list_backend_devices();
+        const auto append_escaped = [](std::string & out, const std::string & value) {
+            for (const char ch : value) {
+                switch (ch) {
+                    case '"': out += "\\\""; break;
+                    case '\\': out += "\\\\"; break;
+                    case '\n': out += "\\n"; break;
+                    case '\r': out += "\\r"; break;
+                    case '\t': out += "\\t"; break;
+                    default:
+                        if (static_cast<unsigned char>(ch) >= 0x20) out.push_back(ch);
+                        break;
+                }
+            }
+        };
+        // Expose CLI/backend spellings, not ggml registry names ("MTL" -> "metal").
+        // Accelerators (BLAS and friends) are not selectable runtime backends.
+        const auto canonical_backend = [](const std::string & registry) -> const char * {
+            if (registry == "MTL") return "metal";
+            if (registry == "CUDA" || registry == "MUSA") return "cuda";
+            if (registry == "ROCm") return "hip";
+            if (registry == "Vulkan") return "vulkan";
+            if (registry == "CPU") return "cpu";
+            return nullptr;
+        };
+        g_devices_json.push_back('[');
+        bool first = true;
+        for (const auto & device : devices) {
+            const char * backend_name = canonical_backend(device.backend);
+            if (backend_name == nullptr || device.type == "ACCEL") continue;
+            if (!first) g_devices_json.push_back(',');
+            first = false;
+            g_devices_json += "{\"backend\":\"";
+            append_escaped(g_devices_json, backend_name);
+            g_devices_json += "\",\"index\":";
+            g_devices_json += std::to_string(device.index);
+            g_devices_json += ",\"name\":\"";
+            append_escaped(g_devices_json, device.name);
+            g_devices_json += "\",\"type\":\"";
+            append_escaped(g_devices_json, device.type);
+            g_devices_json += "\"}";
+        }
+        g_devices_json.push_back(']');
+    } catch (...) {
+        g_devices_json = "[]";
+    }
+    return g_devices_json.c_str();
+}
