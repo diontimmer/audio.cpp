@@ -255,6 +255,13 @@ AUDIOCPP_API void            audiocpp_session_free(audiocpp_session * session);
 
 AUDIOCPP_API const char * audiocpp_session_family(const audiocpp_session * session);
 
+/* Enumerates every device of every loaded ggml backend registry as a JSON
+ * array: [{"backend":"metal","index":0,"name":"Apple M5 Pro","type":"GPU"}].
+ * The returned string is owned by the library and stays valid until the next
+ * call on the same thread; "[]" when enumeration is unavailable. This is the
+ * C-ABI form of the CLI's --list-devices and mirrors --backend/--device. */
+AUDIOCPP_API const char * audiocpp_list_devices_json(void);
+
 /* Optional. audiocpp_session_run() and audiocpp_stream_start() always prepare
  * with the request they are about to run -- preparation carries the input
  * length, so a session prepared for one request must not run another. Call this
