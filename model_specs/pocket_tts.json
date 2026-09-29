@@ -242,5 +242,71 @@
         "weights": "language:model.safetensors"
       }
     }
-  ]
+  ],
+  "options": {
+    "request": [
+      {
+        "name": "max_tokens",
+        "type": "int",
+        "description": "Positive token budget for PocketTTS text conditioning and generation; native default 50.",
+        "required": false,
+        "min": 1,
+        "default": 50
+      },
+      {
+        "name": "seed",
+        "type": "int",
+        "description": "Optional unsigned 32-bit synthesis seed; omitted requests choose a random seed.",
+        "required": false,
+        "min": 0
+      },
+      {
+        "name": "voice_clone_text",
+        "type": "string",
+        "description": "Optional transcript supplied alongside reference clone audio.",
+        "required": false
+      },
+      {
+        "name": "truncate_clone_audio",
+        "type": "bool",
+        "description": "Whether to truncate clone reference audio according to the native conditioning policy.",
+        "required": false,
+        "default": false
+      },
+      {
+        "name": "text_chunk_size",
+        "type": "int",
+        "description": "Optional explicit character-budget chunk size; omitted uses native token-budget behavior.",
+        "required": false,
+        "min": 1
+      }
+    ],
+    "session": [
+      {
+        "name": "voice_state_cache_slots",
+        "type": "int",
+        "description": "Prepared voice-state cache slots; default 4, set 0 to disable.",
+        "required": false,
+        "min": 0,
+        "default": 4
+      }
+    ],
+    "load": [
+      {
+        "name": "language",
+        "type": "enum",
+        "description": "Language-specific checkpoint data root. Must match the selected package.",
+        "values": [
+          "english",
+          "german",
+          "italian",
+          "portuguese",
+          "spanish"
+        ],
+        "required": false,
+        "default": "english"
+      }
+    ]
+  },
+  "options_status": "declared_from_pinned_loader_and_session_option_parsers"
 }
