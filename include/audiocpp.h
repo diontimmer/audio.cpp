@@ -415,6 +415,13 @@ AUDIOCPP_API audiocpp_status audiocpp_result_text(const audiocpp_result * result
                                                   const char ** out_text,
                                                   const char ** out_language);
 
+/* Model-specific JSON result. Both strings are borrowed from the result and
+ * remain valid until it is freed. NOT_AVAILABLE when no schema output exists.
+ * Serialization errors are reported through the usual status/last_error API. */
+AUDIOCPP_API audiocpp_status audiocpp_result_schema_json(const audiocpp_result * result,
+                                                         const char ** out_schema,
+                                                         const char ** out_json);
+
 AUDIOCPP_API size_t          audiocpp_result_segment_count(const audiocpp_result * result);
 AUDIOCPP_API audiocpp_status audiocpp_result_segment(const audiocpp_result * result,
                                                      size_t index,

@@ -192,6 +192,7 @@ struct audiocpp_request {
 
 struct audiocpp_result {
     rt::TaskResult result;
+    mutable std::optional<std::string> schema_json;
     /* An event exposes its contents through a result view that it owns. The
      * view has the same type as an owned result and there is a public free for
      * that type, so freeing one has to be a no-op rather than a double free. */
@@ -998,6 +999,23 @@ audiocpp_status audiocpp_result_named_audio(const audiocpp_result * result,
     if (out_sample_rate != nullptr) *out_sample_rate = named.audio.sample_rate;
     if (out_channels != nullptr) *out_channels = named.audio.channels;
     return AUDIOCPP_OK;
+}
+
+audiocpp_status audiocpp_result_schema_json(const audiocpp_result * result,
+                                           const char ** out_schema,
+                                           const char ** out_json) {
+    if (out_schema) *out_schema = nullptr;
+    if (out_json) *out_json = nullptr;
+    return guard([&] {
+        if (!result) return fail(AUDIOCPP_ERR_INVALID_ARGUMENT, "result must be non-null");
+        if (!result->result.custom_schema_output)
+            return fail(AUDIOCPP_ERR_NOT_AVAILABLE, "result has no schema output");
+        const auto & schema = *result->result.custom_schema_output;
+        if (!result->schema_json) result->schema_json = engine::io::json::stringify(schema.data);
+        assign_out(out_schema, schema.schema);
+        assign_out(out_json, *result->schema_json);
+        return AUDIOCPP_OK;
+    });
 }
 
 size_t audiocpp_result_artifact_count(const audiocpp_result * result) {
