@@ -2,11 +2,14 @@
 
 | Model | Family | Mode(s) | Quick Start |
 |---|---|---|---|
+| Audio Flamingo 3 / Next | `audio_flamingo` | offline | [Audio Flamingo](models/audio_flamingo.md) |
 | Canary 180M Flash | `canary_asr` | offline | [Canary 180M Flash](models/canary_asr.md) |
 | Cohere Transcribe | `cohere_asr` | offline | [Cohere Transcribe](models/cohere_asr.md) |
+| CrisperWhisper 2.0 Large | `crisperwhisper` | offline, streaming | [CrisperWhisper 2.0](models/crisperwhisper.md) |
 | GigaAM v3 / Multilingual | `gigaam_asr` | offline | [GigaAM ASR](models/gigaam_asr.md) |
 | Fun-ASR-Nano | `fun_asr_nano` | offline | [Fun-ASR-Nano](#fun-asr-nano) |
 | Granite Speech 5.0 TurboCTC | `granite5asr` | offline | [Granite Speech 5.0 TurboCTC](community_models/granite5asr.md) |
+| LFM2.5-Audio | `lfm2_audio` | offline | [LFM2.5-Audio](community_models/lfm2_audio.md) |
 | Qwen3 ASR | `qwen3_asr` | offline, streaming | [Qwen3 ASR](#qwen3-asr) |
 | SAMSONE | `samsone` | offline | [SAMSONE](models/samsone.md) |
 | Confucius4-R2T2 | `confucius4_r2t2` | offline, streaming | [Confucius4-R2T2](community_models/r2t2.md) |
@@ -112,10 +115,19 @@ audiocpp_gguf.exe --input models\citrinet\citrinet_256.safetensors --root models
 The GGUF embeds `citrinet_256_config.json` and the vocabulary/tokenizer sidecars, so the
 completed `model.gguf` can be moved, renamed, and passed directly to `--model`.
 
+### Common Options (use directly)
+
 | Option | Values | Default | Meaning |
 |---|---|---:|---|
 | `--audio` | WAV path | required | Speech input. Use 16 kHz WAV for the example path. |
 | `--backend` | `cpu`, `cuda`, `vulkan`, `metal`, `best` | `cpu` | Compute backend. |
+
+### Session Options (use with `--session-option`)
+
+| Option | Values | Default | Meaning |
+|---|---|---:|---|
+| `citrinet_asr.weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | `native` | Weight storage type used by the encoder. |
+
 
 ## Kroko Community ASR
 

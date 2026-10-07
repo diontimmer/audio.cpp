@@ -325,6 +325,7 @@
     universr: 'UniverSR',
     pulsevad: 'PulseVAD',
     nemotron_3_diar: 'Nemotron 3 Diarization',
+    lfm2_audio: 'LFM2.5-Audio',
     personaplex: 'PersonaPlex'
   };
 
@@ -461,7 +462,8 @@
     selected?.family === 'midashenglm_gen';
   $: supportsTextOnlyTts = (
     selected?.family === 'breeze_tts' ||
-    selected?.family === 'chatterbox_turbo' || selected?.family === 'maya1'
+    selected?.family === 'chatterbox_turbo' || selected?.family === 'maya1' ||
+    (selected?.family === 'lfm2_audio' && !selected?.builtin_voices?.length)
   ) && selected?.task === 'tts';
   $: needsSource = ['asr', 'vc', 'svc', 's2s', 'sep', 'vad', 'diar', 'align', 'midi'].includes(selected?.task) ||
     isFireRedAudioEdit || selected?.family === 'liveavatar' ||
@@ -580,10 +582,10 @@
   }
 
   function modelMatchesSelectedPackage(model: LoadedModel, entry: CatalogEntry | undefined) {
-    if (!entry) return comparablePath(model.path) === comparablePath(modelPath);
+    if (!entry) return catalogPathMatches(modelPath, model.path);
     const choice = selectedPackageChoice(entry);
-    if (!choice) return comparablePath(model.path) === comparablePath(modelPath);
-    return comparablePath(model.path) === comparablePath(modelPath) &&
+    if (!choice) return catalogPathMatches(modelPath, model.path);
+    return catalogPathMatches(modelPath, model.path) &&
       packageSessionOptionsMatch(entry, choice, model);
   }
 
@@ -1226,9 +1228,8 @@
     status = `Loading ${selected.display_name}…`;
     log(status);
     try {
-      const targetPath = comparablePath(modelPath);
       const replaced = loadedModels.filter((model) => model.loaded &&
-        (model.id !== selected.id || comparablePath(model.path) !== targetPath ||
+        (model.id !== selected.id || !catalogPathMatches(modelPath, model.path) ||
           !modelMatchesSelectedPackage(model, selected)));
       for (const model of replaced) {
         log(`Unloading ${loadedModelName(model)} before loading ${selected.display_name}.`);

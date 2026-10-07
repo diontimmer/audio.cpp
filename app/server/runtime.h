@@ -83,6 +83,10 @@ private:
         bool accepts_language = true;
         bool accepts_speed = true;
         bool accepts_speaking_rate = true;
+        // The spec's request options as a JSON array, served by
+        // `GET /v1/models?include_params=true`. Resolved at registration for the
+        // same cost reason as the flags above; "[]" when the spec declares none.
+        std::string request_params_json = "[]";
         // Serializes runs on this model and bounds how long a caller waits for its
         // turn; see BusyGuard.
         BusyGuard busy;
@@ -206,6 +210,7 @@ private:
         std::optional<int> busy_timeout_ms = std::nullopt);
     HttpResponse handle_transcription_live(const HttpRequest & request);
     HttpResponse handle_generic_run(const std::string & body_text);
+    HttpResponse handle_generic_batch(const std::string & body_text);
     HttpResponse handle_generic_stream(const std::string & body_text);
     HttpResponse handle_voices(const HttpRequest & request) const;
     HttpResponse handle_unload_models(const std::string & body_text);
@@ -214,7 +219,7 @@ private:
     // that long without a model load/run, unloads every resident (non-busy) model.
     void idle_unload_loop();
     void unload_idle_models();
-    std::string models_json(bool include_session_options = false) const;
+    std::string models_json(bool include_session_options = false, bool include_params = false) const;
     std::string get_allowed_origin(const HttpRequest & request) const;
 
     ServerConfig config_;

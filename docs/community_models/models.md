@@ -16,6 +16,7 @@ Practical expectations:
 
 | Family | Task | Supported language(s) | Contributor | What They Added |
 |---|---|---|---|---|
+| **reuse** | Speech restoration | lang agnostic | [@0xShug0](https://github.com/0xShug0) | [RE-USE](reuse.md) sample-rate-independent speech restoration with bidirectional Mamba |
 | **audio8_asr** | ASR | en, zh, yue, ja, ko, fr, de | [@0xShug0](https://github.com/0xShug0) | [Audio8-ASR-0.1B](audio8_asr.md) compact multilingual autoregressive ASR reusing the Qwen3-ASR encoder with an MLP-tower adapter and an 8-layer Qwen2-style decoder (CC-BY-NC, local conversion only) |
 | **auk** | TTS, audio editing | auto | [@0xShug0](https://github.com/0xShug0) | [AuK Base and AuK-Flash](auk.md) instruction-guided speech generation and editing with separate generator, Qwen conditioner, and VAE components |
 | **chatterbox_turbo** | TTS, voice cloning (testing) | en | [@pannagaps](https://github.com/pannagaps) | [Chatterbox Turbo](chatterbox_turbo.md) Resemble AI's distilled 350M GPT2 T3 backbone + 2-step meanflow S3Gen decoder for fast English TTS; built-in default voice only for now |
@@ -27,6 +28,8 @@ Practical expectations:
 | **inflect_v2** | TTS | en | Community | [Inflect Micro v2 and Nano v2](inflect_v2.md) native FP32 offline synthesis |
 | **kroko_asr** | ASR | de, en, es, fr, it, he, nl, pt, sv, tr | Mirek [@mirek190](https://github.com/mirek190) | [Kroko Community ASR](kroko_asr.md) native offline/streaming Zipformer2/RNN-T transcription with word timestamps |
 | **kitten_tts** | TTS | en | Community | [KittenTTS Mini 0.8](kitten_tts.md) native 80M-parameter synthesis with eight built-in voices and the shared eSpeak-ng frontend |
+| **kitten_tts2** | TTS, Clone | en, ar, zh, fr, de, hi, it, pt, ru, es | Community | [Kitten TTS 2](kitten_tts2.md) native Qwen3, S3 meanflow, HiFT, multilingual preset voices, reference-audio cloning, and long-form synthesis |
+| **lfm2_audio** | ASR, TTS, S2S | en, ja | [@ykhrustalev](https://github.com/ykhrustalev) / Liquid AI | [LFM2.5-Audio](lfm2_audio.md) English and Japanese transcription, speech and spoken chat from Liquid AI's published GGUFs: LFM2 hybrid short-conv/attention backbone with a FastConformer encoder for audio input, and a depthformer and LFM2 detokenizer for 24 kHz speech in four built-in English voices; spoken questions get replies of interleaved text and speech; offline or streamed frame by frame |
 | **liveavatar** | Audio-to-video | auto | [@0xShug0](https://github.com/0xShug0) | [LiveAvatar](liveavatar.md) audio-to-video avatar generation with Wan2.2 S2V and an optional low-VRAM denoiser path |
 | **mms_forced_aligner** | Align | nl (nld), en (eng); pre-romanized Latin | Community | [MMS-300M-1130 Forced Aligner](mms_forced_aligner.md) word-timestamp alignment from a wav2vec2 CTC checkpoint (safetensors or local GGUF) |
 | **minimax_h3** | Video, Music, TTS/Dialogue | auto | [@0xShug0](https://github.com/0xShug0) | [MiniMax-H3](minimax_h3.md) text-to-audio/video generation with Q4_K and optional INT8 ConvRot DiT |
