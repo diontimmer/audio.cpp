@@ -2,6 +2,7 @@
 
 #include "engine/framework/core/attention_fallback.h"
 #include "engine/framework/runtime/session.h"
+#include "engine/framework/runtime/streaming_audio.h"
 #include "engine/models/breeze_tts/assets.h"
 #include "engine/models/breeze_tts/speech_decoder.h"
 #include "engine/models/breeze_tts/text_encoder.h"
@@ -29,11 +30,6 @@ struct BreezeGenerationRequest {
     uint64_t seed = 0;
 };
 
-struct BreezeStreamEvent {
-    engine::runtime::AudioBuffer audio;
-    bool done = false;
-};
-
 // BreezeTTS 2's reference inference rounds activations to bf16 (and keeps a bf16
 // KV cache). That is what the model was trained with, but on backends without a
 // cheap fused cast it costs a visible share of the AR loop, so the choice is
@@ -45,6 +41,18 @@ enum class Bf16ActivationMode {
     Off,
 };
 
+// CUDA/Vulkan/Metal performance defaults; cuda_perf additionally enables CUDA batched CFG.
+struct BreezePerfOptions {
+    // Decode each frame's depth codebooks in one graph with device sampling.
+    bool fused_depth = true;
+    // Offline prefill writes the backbone KV straight into the decode cache.
+    bool direct_prefill = true;
+    // Skip re-rounding the F16 KV cache to bf16 after each update (an identity).
+    bool skip_cache_round = true;
+    // With CFG, decode both backbone branches as one batch-2 step.
+    bool batched_cfg = false;
+};
+
 class BreezeGeneratorRuntime {
 public:
     BreezeGeneratorRuntime(
@@ -54,13 +62,19 @@ public:
         size_t weight_context_bytes,
         engine::assets::TensorStorageType storage_type,
         engine::core::AttentionPreference attention_preference = engine::core::AttentionPreference::Auto,
-        Bf16ActivationMode bf16_activations = Bf16ActivationMode::Auto);
+        Bf16ActivationMode bf16_activations = Bf16ActivationMode::Auto,
+        BreezePerfOptions perf = {});
     ~BreezeGeneratorRuntime();
 
-    engine::runtime::AudioBuffer generate(const BreezeGenerationRequest & request);
+    engine::runtime::AudioBuffer generate(
+        const BreezeGenerationRequest & request,
+        BreezeSpeechCodes * generated_codes = nullptr);
     BreezeSpeechCodes encode_reference(const engine::runtime::AudioBuffer & audio) const;
-    void begin_stream(const BreezeGenerationRequest & request);
-    BreezeStreamEvent next_stream_audio(size_t max_new_frames, int64_t lookahead_margin);
+    engine::runtime::AudioBuffer generate_stream(
+        const BreezeGenerationRequest & request,
+        engine::runtime::StreamingAudioConfig config,
+        engine::runtime::StreamEventCallback sink,
+        BreezeSpeechCodes * generated_codes = nullptr);
     void end_stream();
 
 private:

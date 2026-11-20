@@ -18,16 +18,28 @@ struct SanoTtsGenerationOptions {
     uint64_t seed = 0;
 };
 
+/** Which code runs the frame stage + decoder on a CPU backend
+ *  (selected through sanotts.exec_plan). */
+enum class SanoTtsCpuDecoder {
+    Auto,   // NEON on supported AArch64 CPU sessions, otherwise GGML
+    Ggml,   // the GGML graph (every platform and backend)
+    Neon,   // hand-written ARM NEON kernels (AArch64 CPU backend only)
+};
+
 class SanoTtsNativeRuntime {
 public:
     SanoTtsNativeRuntime(
         std::shared_ptr<const SanoTtsAssets> assets,
-        core::BackendConfig backend_config);
+        core::BackendConfig backend_config,
+        SanoTtsCpuDecoder cpu_decoder = SanoTtsCpuDecoder::Auto);
     ~SanoTtsNativeRuntime();
 
+    /** token_frames_out, when given, receives each token's rounded duration
+     *  in decoder frames (hop_length samples each), for word timestamps. */
     runtime::AudioBuffer synthesize(
         const std::vector<int32_t> & token_ids,
-        const SanoTtsGenerationOptions & options);
+        const SanoTtsGenerationOptions & options,
+        std::vector<int64_t> * token_frames_out = nullptr);
 
 private:
     struct State;

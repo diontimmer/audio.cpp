@@ -1,16 +1,45 @@
 #include "engine/models/audio_flamingo/assets.h"
 
 #include "engine/framework/assets/resource_bundle.h"
+#include "engine/framework/assets/weight_adapter.h"
 #include "engine/framework/io/filesystem.h"
 #include "engine/framework/io/json.h"
 #include "engine/framework/model_spec/package.h"
+#include "engine/framework/runtime/model_routing.h"
 
 #include <stdexcept>
 #include <utility>
 
 namespace engine::models::audio_flamingo {
+// Implementation registrations. Checkpoint identity is resolved only here.
+const AudioFlamingoImplementation kAudioFlamingoV3Implementation = [] {
+    AudioFlamingoImplementation impl{};
+    impl.variant = AudioFlamingoVariant::V3;
+    impl.default_max_audio_length_sec = 600;
+    impl.use_rote = false;
+    impl.frame_audio_tokens = false;
+    impl.allow_temporal_grounding = true;
+    return impl;
+}();
+const AudioFlamingoImplementation kAudioFlamingoNextImplementation = [] {
+    AudioFlamingoImplementation impl{};
+    impl.variant = AudioFlamingoVariant::Next;
+    impl.default_max_audio_length_sec = 1800;
+    impl.use_rote = true;
+    impl.frame_audio_tokens = true;
+    impl.allow_temporal_grounding = false;
+    return impl;
+}();
+
 namespace json = engine::io::json;
 namespace {
+
+const runtime::ModelRouteEntry<std::string, AudioFlamingoImplementation> kImplementations[] = {
+    {"audioflamingo3", &kAudioFlamingoV3Implementation},
+    {"musicflamingo", &kAudioFlamingoNextImplementation},
+};
+const runtime::ModelRouteTable<std::string, AudioFlamingoImplementation>
+    kImplementationTable("Audio Flamingo", kImplementations);
 
 AudioFlamingoAudioEncoderConfig parse_audio_config(const engine::io::json::Value & value) {
     AudioFlamingoAudioEncoderConfig config;
@@ -55,9 +84,9 @@ AudioFlamingoTextDecoderConfig parse_text_config(
 AudioFlamingoFrontendConfig parse_frontend_config(
     const engine::io::json::Value & processor_config,
     const AudioFlamingoAudioEncoderConfig & audio_config,
-    AudioFlamingoVariant variant) {
+    const AudioFlamingoImplementation &impl) {
     AudioFlamingoFrontendConfig config;
-    const int64_t default_max_audio_length = variant == AudioFlamingoVariant::Next ? 1800 : 600;
+    const int64_t default_max_audio_length = impl.default_max_audio_length_sec;
     config.max_audio_length_sec = json::optional_i64(processor_config, "max_audio_len", default_max_audio_length);
     const auto & frontend = processor_config.require("feature_extractor");
     config.sample_rate = static_cast<int>(frontend.require("sampling_rate").as_i64());
@@ -88,11 +117,9 @@ AudioFlamingoConfig parse_config(const assets::ResourceBundle & resources) {
 
     AudioFlamingoConfig config;
     const auto model_type = root.require("model_type").as_string();
-    if (model_type == "audioflamingo3") {
-        config.variant = AudioFlamingoVariant::V3;
-    } else if (model_type == "musicflamingo") {
-        config.variant = AudioFlamingoVariant::Next;
-    } else {
+    try {
+        config.impl = &kImplementationTable.require(model_type);
+    } catch (const std::invalid_argument &) {
         throw std::runtime_error("unsupported Audio Flamingo model_type: " + model_type);
     }
     config.projector_bias = json::optional_bool(root, "projector_bias", config.projector_bias);
@@ -100,9 +127,9 @@ AudioFlamingoConfig parse_config(const assets::ResourceBundle & resources) {
         throw std::runtime_error("Audio Flamingo projector currently expects gelu activation");
     }
     config.audio_encoder = parse_audio_config(root.require("audio_config"));
-    config.frontend = parse_frontend_config(processor_config, config.audio_encoder, config.variant);
+    config.frontend = parse_frontend_config(processor_config, config.audio_encoder, *config.impl);
     config.text_decoder = parse_text_config(root, root.require("text_config"), generation_config);
-    if (config.variant == AudioFlamingoVariant::Next) {
+    if (config.impl->use_rote) {
         config.rote = parse_rote_config(root);
     }
     config.max_new_tokens = json::optional_i64(generation_config, "max_new_tokens", config.max_new_tokens);
@@ -118,6 +145,25 @@ std::shared_ptr<const AudioFlamingoAssets> load_audio_flamingo_assets(const std:
     assets.model_weights = resources.open_tensor_source("weights");
     assets.resources = std::move(resources);
     return std::make_shared<AudioFlamingoAssets>(std::move(assets));
+}
+
+std::shared_ptr<const AudioFlamingoAssets> load_audio_flamingo_adapter(
+    std::shared_ptr<const AudioFlamingoAssets> assets,
+    const std::filesystem::path & path, float strength) {
+    engine::assets::WeightAdapterReadOptions options;
+    options.require_scaling_metadata = true;
+    options.strength = strength;
+    auto adapter = engine::assets::read_weight_adapter(path, options);
+    engine::assets::WeightAdapterBindings bindings;
+    for (const auto & tensor : assets->model_weights->tensors()) {
+        bindings.add(tensor.name, tensor.name);
+    }
+    auto plan = engine::assets::bind_weight_adapter(
+        *assets->model_weights, std::move(adapter), bindings, engine::assets::WeightMergeMode::DeltaF32);
+    auto adapted = std::make_shared<AudioFlamingoAssets>(*assets);
+    adapted->model_weights = engine::assets::make_weight_adapter_source(
+        assets->model_weights, std::move(plan), "audio_flamingo.lora");
+    return adapted;
 }
 
 }  // namespace engine::models::audio_flamingo

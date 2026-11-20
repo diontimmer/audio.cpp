@@ -2,16 +2,26 @@
 
 #include "args.h"
 
+#include "../common/base64.h"
+
 #include "engine/framework/audio/wav_reader.h"
 
 #include <cmath>
+#include <cstddef>
 #include <filesystem>
+#include <fstream>
+#include <initializer_list>
 #include <iomanip>
+#include <iterator>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <utility>
 
 namespace minitts::cli {
+
+using engine::runtime::InvalidRequestError;
+
 namespace {
 
 std::string path_arg_string(const std::filesystem::path & path) {
@@ -34,6 +44,157 @@ void set_option_from_json_field(
     if (value != nullptr && !value->is_null()) {
         set_option(options, option_key, json_option_string(*value));
     }
+}
+
+struct ArtifactKindName {
+    const char * name;
+    engine::runtime::ArtifactKind kind;
+};
+
+// The names the server writes a result artifact's kind with.
+constexpr ArtifactKindName kArtifactKinds[] = {
+    {"speaker_embedding", engine::runtime::ArtifactKind::SpeakerEmbedding},
+    {"style_embedding", engine::runtime::ArtifactKind::StyleEmbedding},
+    {"prompt_embedding", engine::runtime::ArtifactKind::PromptEmbedding},
+    {"acoustic_tokens", engine::runtime::ArtifactKind::AcousticTokens},
+    {"midi", engine::runtime::ArtifactKind::Midi},
+    {"transcript_alignment", engine::runtime::ArtifactKind::TranscriptAlignment},
+    {"diarization_state", engine::runtime::ArtifactKind::DiarizationState},
+    {"vad_state", engine::runtime::ArtifactKind::VadState},
+    {"custom", engine::runtime::ArtifactKind::Custom},
+};
+
+constexpr bool artifact_kinds_in_enum_order() {
+    for (size_t index = 0; index < std::size(kArtifactKinds); ++index) {
+        if (kArtifactKinds[index].kind != static_cast<engine::runtime::ArtifactKind>(index)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Custom is the last ArtifactKind, so a kind added to the enum without a name
+// here fails to build instead of being turned away as unknown.
+static_assert(
+    std::size(kArtifactKinds) == static_cast<size_t>(engine::runtime::ArtifactKind::Custom) + 1 &&
+        artifact_kinds_in_enum_order(),
+    "kArtifactKinds must name every ArtifactKind, in enum order");
+
+bool is_artifact_field(const std::string & key) {
+    for (const char * field : {"id", "kind", "payload", "path", "meta"}) {
+        if (key == field) {
+            return true;
+        }
+    }
+    return false;
+}
+
+engine::runtime::ArtifactKind parse_artifact_kind(const std::string & name, const std::string & where) {
+    for (const auto & entry : kArtifactKinds) {
+        if (name == entry.name) {
+            return entry.kind;
+        }
+    }
+    std::string names;
+    for (const auto & entry : kArtifactKinds) {
+        names += (names.empty() ? "" : ", ") + std::string(entry.name);
+    }
+    throw InvalidRequestError(where + ": unknown kind '" + name + "', expected one of " + names);
+}
+
+// A field that is absent or null reads as not given.
+const engine::io::json::Value * artifact_field(
+    const engine::io::json::Value & entry,
+    const std::string & key) {
+    const auto * value = entry.find(key);
+    return value == nullptr || value->is_null() ? nullptr : value;
+}
+
+std::string artifact_string(
+    const engine::io::json::Value & entry,
+    const std::string & key,
+    const std::string & where) {
+    const auto * value = artifact_field(entry, key);
+    if (value == nullptr || !value->is_string() || value->as_string().empty()) {
+        throw InvalidRequestError(where + ": " + key + " must be a non-empty string");
+    }
+    return value->as_string();
+}
+
+[[noreturn]] void throw_artifact_limit(const std::string & where) {
+    throw InvalidRequestError(
+        where + ": the request's artifact payloads total more than " +
+        std::to_string(kMaxRequestArtifactBytes) + " bytes");
+}
+
+std::vector<std::byte> decode_artifact_payload(
+    const engine::io::json::Value & payload,
+    uint64_t budget,
+    const std::string & where) {
+    if (!payload.is_string()) {
+        throw InvalidRequestError(where + ": payload must be a base64 string");
+    }
+    // An inline payload is already in memory as part of the request, so the
+    // server's request body limit bounds this decode.
+    std::vector<std::byte> bytes;
+    try {
+        bytes = minitts::app::base64_decode_bytes(payload.as_string());
+    } catch (const std::runtime_error & error) {
+        throw InvalidRequestError(where + ": payload is not valid base64 (" + error.what() + ")");
+    }
+    if (bytes.size() > budget) {
+        throw_artifact_limit(where);
+    }
+    return bytes;
+}
+
+std::vector<std::byte> read_artifact_file(
+    const std::filesystem::path & path,
+    uint64_t budget,
+    const std::string & where) {
+    // Regular files only: a FIFO or a device such as /dev/zero has no size to
+    // check and may never end.
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(path, error)) {
+        throw InvalidRequestError(where + ": path is not a regular file: " + path.string());
+    }
+    const auto size = std::filesystem::file_size(path, error);
+    if (error) {
+        throw InvalidRequestError(where + ": cannot read the size of " + path.string() + ": " + error.message());
+    }
+    if (static_cast<uint64_t>(size) > budget) {
+        throw_artifact_limit(where);
+    }
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw InvalidRequestError(where + ": failed to open " + path.string());
+    }
+    std::vector<std::byte> bytes(static_cast<size_t>(size));
+    if (!bytes.empty() &&
+        !input.read(reinterpret_cast<char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) {
+        throw InvalidRequestError(where + ": failed to read " + path.string());
+    }
+    return bytes;
+}
+
+std::unordered_map<std::string, std::string> artifact_meta(
+    const engine::io::json::Value & entry,
+    const std::string & where) {
+    std::unordered_map<std::string, std::string> meta;
+    const auto * value = artifact_field(entry, "meta");
+    if (value == nullptr) {
+        return meta;
+    }
+    if (!value->is_object()) {
+        throw InvalidRequestError(where + ": meta must be an object");
+    }
+    for (const auto & [key, child] : value->as_object()) {
+        if (!child.is_string() && !child.is_number() && !child.is_bool()) {
+            throw InvalidRequestError(where + ": meta." + key + " must be a string, number or boolean");
+        }
+        meta[key] = json_option_string(child);
+    }
+    return meta;
 }
 
 }  // namespace
@@ -120,6 +281,114 @@ std::optional<float> json_optional_float(
     return value->as_f32();
 }
 
+std::vector<engine::runtime::VoiceArtifact> json_request_artifacts(
+    const engine::io::json::Value * value,
+    const std::filesystem::path & base_dir) {
+    std::vector<engine::runtime::VoiceArtifact> artifacts;
+    if (value == nullptr || value->is_null()) {
+        return artifacts;
+    }
+    if (!value->is_array()) {
+        throw InvalidRequestError("artifacts must be an array of artifact objects");
+    }
+    uint64_t total_bytes = 0;
+    const auto & entries = value->as_array();
+    for (size_t index = 0; index < entries.size(); ++index) {
+        const auto & entry = entries[index];
+        std::string where = "artifacts[" + std::to_string(index) + "]";
+        if (!entry.is_object()) {
+            throw InvalidRequestError(where + " must be an object with id, kind, and payload or path");
+        }
+        for (const auto & field : entry.as_object()) {
+            if (!is_artifact_field(field.first)) {
+                throw InvalidRequestError(
+                    where + ": unknown field '" + field.first + "', an artifact has id, kind, payload or path, and meta");
+            }
+        }
+        engine::runtime::VoiceArtifact artifact;
+        artifact.id = artifact_string(entry, "id", where);
+        where += " (" + artifact.id + ")";
+        const auto * kind = artifact_field(entry, "kind");
+        if (kind == nullptr || !kind->is_string()) {
+            throw InvalidRequestError(where + ": kind must be a string");
+        }
+        artifact.kind = parse_artifact_kind(kind->as_string(), where);
+        const auto * payload = artifact_field(entry, "payload");
+        const bool has_path = artifact_field(entry, "path") != nullptr;
+        if ((payload != nullptr) == has_path) {
+            throw InvalidRequestError(
+                where + ": give exactly one of payload (base64) and path (a file holding the payload)");
+        }
+        const uint64_t budget = kMaxRequestArtifactBytes - total_bytes;
+        artifact.payload = payload != nullptr
+            ? decode_artifact_payload(*payload, budget, where)
+            : read_artifact_file(resolve_case_path(base_dir, artifact_string(entry, "path", where)), budget, where);
+        total_bytes += artifact.payload.size();
+        artifact.meta = artifact_meta(entry, where);
+        artifacts.push_back(std::move(artifact));
+    }
+    return artifacts;
+}
+
+namespace {
+
+// The reference voice in the shapes /v1/audio/speech takes: a path, or
+// {"type": "path", "path": ...} or {"type": "base64", "data": ...} for a
+// WAV sent inline, so a server needn't store a caller's voice on disk.
+engine::runtime::AudioBuffer read_voice_ref(
+    const engine::io::json::Value & voice_ref,
+    const std::filesystem::path & base_dir) {
+    if (voice_ref.is_string()) {
+        return read_audio_buffer(resolve_case_path(base_dir, voice_ref.as_string()));
+    }
+    if (!voice_ref.is_object()) {
+        throw InvalidRequestError(
+            "voice_ref must be a path string or an object with type \"path\" or \"base64\"");
+    }
+    const auto * type = voice_ref.find("type");
+    if (type == nullptr || !type->is_string()) {
+        throw InvalidRequestError("voice_ref type must be \"path\" or \"base64\"");
+    }
+    if (type->as_string() == "path") {
+        const auto * path = voice_ref.find("path");
+        if (path == nullptr || !path->is_string()) {
+            throw InvalidRequestError("voice_ref of type \"path\" needs a path string");
+        }
+        return read_audio_buffer(resolve_case_path(base_dir, path->as_string()));
+    }
+    if (type->as_string() != "base64") {
+        throw InvalidRequestError("voice_ref type must be \"path\" or \"base64\"");
+    }
+    constexpr size_t kMaxVoiceRefBytes = size_t{5} * 1024 * 1024;
+    constexpr size_t kMaxVoiceRefBase64Length = ((kMaxVoiceRefBytes + 2) / 3) * 4 + 4096;
+    const auto * data = voice_ref.find("data");
+    if (data == nullptr || !data->is_string()) {
+        throw InvalidRequestError("voice_ref of type \"base64\" needs a data string");
+    }
+    if (data->as_string().size() > kMaxVoiceRefBase64Length) {
+        throw InvalidRequestError("voice_ref base64 data exceeds the 5 MiB limit");
+    }
+    std::vector<std::byte> bytes;
+    try {
+        bytes = minitts::app::base64_decode_bytes(data->as_string());
+    } catch (const std::runtime_error & error) {
+        throw InvalidRequestError(std::string("voice_ref base64 data is not valid base64 (") + error.what() + ")");
+    }
+    if (bytes.empty()) {
+        throw InvalidRequestError("voice_ref base64 data decoded to an empty payload");
+    }
+    if (bytes.size() > kMaxVoiceRefBytes) {
+        throw InvalidRequestError("voice_ref base64 data exceeds the 5 MiB limit");
+    }
+    try {
+        return read_audio_buffer(std::string_view(reinterpret_cast<const char *>(bytes.data()), bytes.size()));
+    } catch (const std::runtime_error & error) {
+        throw InvalidRequestError(std::string("voice_ref base64 data is not a readable WAV (") + error.what() + ")");
+    }
+}
+
+}  // namespace
+
 engine::runtime::TaskRequest build_request_from_json(
     const engine::io::json::Value & value,
     const std::filesystem::path & base_dir) {
@@ -140,11 +409,11 @@ engine::runtime::TaskRequest build_request_from_json(
         voice.speaker = std::move(reference);
         has_voice = true;
     }
-    if (const auto voice_ref = json_optional_string(value, "voice_ref")) {
+    if (const auto * voice_ref = value.find("voice_ref"); voice_ref != nullptr && !voice_ref->is_null()) {
         if (!voice.speaker.has_value()) {
             voice.speaker = engine::runtime::VoiceReference{};
         }
-        voice.speaker->audio = read_audio_buffer(resolve_case_path(base_dir, *voice_ref));
+        voice.speaker->audio = read_voice_ref(*voice_ref, base_dir);
         has_voice = true;
     }
 
@@ -180,6 +449,7 @@ engine::runtime::TaskRequest build_request_from_json(
     if (has_voice) {
         request.voice = std::move(voice);
     }
+    request.input_artifacts = json_request_artifacts(value.find("artifacts"), base_dir);
 
     request.options = json_options_map(value.find("options"));
     if (!language.empty()) {
@@ -356,7 +626,7 @@ engine::runtime::TaskRequest build_request_from_cli(int argc, char ** argv) {
     set_option_from_arg(argc, argv, "--lyrics", "lyrics", request.options);
     set_option_from_arg(argc, argv, "--track-name", "track_name", request.options);
     set_option_from_arg(argc, argv, "--speaker", "speaker", request.options);
-    set_option_from_arg(argc, argv, "--duration-seconds", "duration_seconds", request.options);
+    set_option_from_arg(argc, argv, "--duration-seconds", "duration_sec", request.options);
     set_option_from_arg(argc, argv, "--repaint-start", "repainting_start", request.options);
     set_option_from_arg(argc, argv, "--repaint-end", "repainting_end", request.options);
     set_option_from_arg(argc, argv, "--repaint-mode", "repaint_mode", request.options);
@@ -374,7 +644,7 @@ engine::runtime::TaskRequest build_request_from_cli(int argc, char ** argv) {
     set_option_from_arg(argc, argv, "--num-inference-steps", "num_inference_steps", request.options);
     set_option_from_arg(argc, argv, "--text-chunk-size", "text_chunk_size", request.options);
     set_option_from_arg(argc, argv, "--text-chunk-mode", "text_chunk_mode", request.options);
-    set_option_from_arg(argc, argv, "--audio-chunk-seconds", "audio_chunk_seconds", request.options);
+    set_option_from_arg(argc, argv, "--audio-chunk-seconds", "audio_chunk_duration_sec", request.options);
     set_option_from_arg(argc, argv, "--audio-chunk-mode", "audio_chunk_mode", request.options);
     set_option_from_arg(argc, argv, "--use-prosody-code", "use_prosody_code", request.options);
     set_option_from_arg(argc, argv, "--predict-target-prosody", "predict_target_prosody", request.options);

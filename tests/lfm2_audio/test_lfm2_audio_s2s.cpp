@@ -10,7 +10,13 @@
 // - replies through the registry, offline and streamed, whose audio says what
 //   their text says, checked by transcribing it back with the ASR task;
 // - a reply cut off at max_tokens, offline and streamed;
-// - the first request again after the others, which must give the same reply.
+// - the first request again after the others, which must give the same reply;
+// - text sampling, which follows the greedy-text reply of the same seed until
+//   a text token differs;
+// - a conversation: the first reply returned as an lfm2_audio.reply artifact,
+//   which holds its text and speech, and a second turn (assets/resources/a.wav)
+//   with the first turn as history, which changes its reply, repeats to the
+//   byte and returns an artifact a third turn replays.
 //
 // --model is the directory of LiquidAI/LFM2.5-Audio-1.5B-GGUF (default
 // models/LFM2.5-Audio-1.5B-GGUF, where the lfm2_audio_1_5b_* packages install);
@@ -21,6 +27,7 @@
 #include "engine/community_models/lfm2_audio/assets.h"
 #include "engine/community_models/lfm2_audio/audio_encoder.h"
 #include "engine/community_models/lfm2_audio/backbone.h"
+#include "engine/community_models/lfm2_audio/chat.h"
 #include "engine/community_models/lfm2_audio/depthformer.h"
 #include "engine/community_models/lfm2_audio/interleaved.h"
 #include "engine/community_models/lfm2_audio/session.h"
@@ -35,12 +42,15 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -59,6 +69,8 @@ constexpr int kExitFail = 1;
 constexpr int kExitSkip = 125;
 
 constexpr const char * kAudio = "assets/resources/c.wav";
+// The second turn of a conversation.
+constexpr const char * kFollowUp = "assets/resources/a.wav";
 
 // ChatState's text around the audio, and where the audio goes.
 const std::vector<int32_t> kPromptIds = {1, 6, 24131, 708, 3104, 4168, 916, 1251, 799, 17927, 3304, 810,
@@ -374,6 +386,69 @@ void check_stage_numbers(
     std::cout << "greedy frames identical: " << compared << " of " << kAudioBlock.size() << "\n";
 }
 
+// Sampled text draws from a stream of its own, so a reply with
+// text_temperature is step for step the greedy-text reply of the same seed,
+// audio codes included, until a text token differs.
+void check_text_sampling(
+    const lfm2::Lfm2AudioComponents & components,
+    const lfm2::Lfm2AudioOutputComponents & output,
+    const engine::core::BackendConfig & backend,
+    Checks & checks) {
+    engine::core::ExecutionContext execution(backend);
+    const lfm2::Lfm2TextTokenizer tokenizer(components.vocabulary);
+    lfm2::Lfm2FastConformerEncoderRuntime encoder(components.mmproj, components.encoder, execution);
+    lfm2::Lfm2BackboneRuntime backbone(
+        components.model, components.backbone, execution, components.mmproj, output.depthformer.codebooks, output.depthformer.audio_vocab_size);
+    lfm2::Lfm2DepthformerRuntime depthformer(output.vocoder, output.depthformer, execution);
+
+    const auto wav = engine::audio::read_wav_f32(repo_path(kAudio));
+    const auto samples = lfm2::lfm2_audio_mono_16k({wav.sample_rate, wav.channels, wav.samples});
+    const auto audio = encoder.encode(lfm2::Lfm2AudioFeatureExtractor(components.encoder.n_mels, backend.threads).extract(samples));
+    const auto prompt = lfm2::make_lfm2_spoken_prompt(tokenizer, lfm2::kLfm2ChatSystemPrompt).with_audio(audio.tokens);
+
+    // 120 steps hold the first seven text blocks.
+    const auto reply = [&](uint64_t seed, const lfm2::Lfm2TextSampling & text_sampling) {
+        lfm2::Lfm2InterleavedOptions options;
+        options.text_steps = output.interleave.text_steps;
+        options.audio_steps = output.interleave.audio_steps;
+        options.max_steps = 120;
+        options.sampling.seed = seed;
+        options.text_sampling = text_sampling;
+        lfm2::Lfm2InterleavedGenerator generator(backbone, depthformer, tokenizer, prompt, audio, output.depthformer.end_of_audio(), options);
+        std::vector<lfm2::Lfm2ReplyStep> steps;
+        while (auto step = generator.next()) {
+            steps.push_back(std::move(*step));
+        }
+
+        return steps;
+    };
+
+    size_t differing = 0;
+    for (const auto & seed : kReplySeeds) {
+        const auto greedy = reply(std::stoull(seed), {});
+        const auto sampled = reply(std::stoull(seed), {1.0f, 0});
+        size_t first = 0;
+        while (first < greedy.size() && first < sampled.size() && greedy[first].token == sampled[first].token &&
+               greedy[first].codes == sampled[first].codes) {
+            ++first;
+        }
+
+        if (first == greedy.size() && first == sampled.size()) {
+            continue;
+        }
+
+        // A reply that drew <|im_end|> ends at that text step.
+        const auto text_at_first = [&](const std::vector<lfm2::Lfm2ReplyStep> & steps) {
+            return first >= steps.size() || steps[first].codes.empty();
+        };
+        ++differing;
+        checks.expect(text_at_first(greedy) && text_at_first(sampled), "seed " + seed + ": sampled text first differs at a text token",
+            "step " + std::to_string(first));
+    }
+
+    checks.expect(differing > 0, "text_temperature 1.0 changes a reply's steps");
+}
+
 std::unique_ptr<engine::runtime::IVoiceTaskSession> open_session(
     engine::runtime::ILoadedVoiceModel & model,
     engine::runtime::VoiceTaskKind task,
@@ -413,6 +488,24 @@ std::string stderr_of(const std::function<void()> & call) {
 
     std::cerr.rdbuf(previous);
     return captured.str();
+}
+
+// A file's bytes, such as a question's WAV for an lfm2_audio.question
+// artifact.
+std::vector<std::byte> file_bytes(const std::filesystem::path & path) {
+    std::ifstream input(path, std::ios::binary);
+    const std::vector<char> bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    std::vector<std::byte> out(bytes.size());
+    std::transform(bytes.begin(), bytes.end(), out.begin(), [](char value) { return static_cast<std::byte>(value); });
+    return out;
+}
+
+bool same_reply(const engine::runtime::TaskResult & a, const engine::runtime::TaskResult & b) {
+    const auto artifact_bytes = [](const engine::runtime::TaskResult & result) {
+        return result.output_artifacts.empty() ? std::vector<std::byte>() : result.output_artifacts.front().payload;
+    };
+    return a.text_output.has_value() && b.text_output.has_value() && a.text_output->text == b.text_output->text && a.audio_output.has_value() &&
+           b.audio_output.has_value() && a.audio_output->samples == b.audio_output->samples && artifact_bytes(a) == artifact_bytes(b);
 }
 
 // Replies through the registry, and their audio back through ASR.
@@ -525,6 +618,8 @@ void check_replies(
     rejects([](auto & r) { r.options["language"] = "ja"; }, "speaks en", "another language");
     // The first 6 steps are the first text block.
     rejects([](auto & r) { r.options["max_tokens"] = "6"; }, "before the reply spoke", "a max_tokens that ends the reply before it speaks");
+    rejects([](auto & r) { r.options["text_temperature"] = "-1"; }, "must not be negative", "a negative text_temperature");
+    rejects([](auto & r) { r.options["text_top_k"] = "-1"; }, "must not be negative", "a negative text_top_k");
 
     // A reply that reaches max_tokens keeps its text and speech, as
     // liquid-audio keeps what it generated at max_new_tokens, with a warning.
@@ -553,6 +648,98 @@ void check_replies(
         again.text_output.has_value() ? again.text_output->text : "");
     checks.expect(has_audio && again.audio_output.has_value() && again.audio_output->samples == reply.audio_output->samples,
         "the first request again has the same audio");
+
+    // Top-k 1 keeps the text greedy at any temperature, as in liquid-audio.
+    auto top_1 = question();
+    top_1.options["text_temperature"] = "0.7";
+    top_1.options["text_top_k"] = "1";
+    const auto top_1_reply = run(*s2s, top_1);
+    checks.expect(top_1_reply.text_output.has_value() && top_1_reply.text_output->text == text, "text_top_k=1 gives the greedy text");
+    checks.expect(has_audio && top_1_reply.audio_output.has_value() && top_1_reply.audio_output->samples == reply.audio_output->samples,
+        "text_top_k=1 gives the greedy reply's audio");
+
+    // A conversation. With return_codes the first reply also comes back as an
+    // lfm2_audio.reply artifact: every step it generated, its text tokens and
+    // its frames.
+    const auto assets = lfm2::load_lfm2_audio_assets(model_dir);
+    const auto components = lfm2::load_lfm2_audio_components(*assets, model_gguf, "");
+    const auto output = lfm2::load_lfm2_audio_output_components(*assets, *components, "", "");
+    const lfm2::Lfm2TextTokenizer tokenizer(components->vocabulary);
+    const lfm2::Lfm2ReplyCheckpoint checkpoint{
+        "en", output->depthformer.codebooks, output->depthformer.audio_vocab_size, components->backbone.vocab_size};
+    auto opening = question();
+    opening.options["return_codes"] = "true";
+    const auto turn_1 = run(*s2s, opening);
+    checks.expect(has_audio && turn_1.text_output.has_value() && turn_1.text_output->text == text && turn_1.audio_output.has_value() &&
+                      turn_1.audio_output->samples == reply.audio_output->samples,
+        "return_codes leaves the reply as it is");
+    std::vector<lfm2::Lfm2ReplyStep> record;
+    try {
+        record = lfm2::read_lfm2_reply_artifact(turn_1.output_artifacts.at(0), checkpoint);
+    } catch (const std::exception & error) {
+        checks.expect(false, "the first turn returns its reply artifact", error.what());
+    }
+
+    std::vector<int32_t> record_tokens;
+    size_t speaking = 0;
+    for (const auto & step : record) {
+        if (step.codes.empty()) {
+            record_tokens.push_back(step.token);
+        } else if (lfm2::lfm2_speaks(step.codes, output->depthformer.end_of_audio())) {
+            ++speaking;
+        }
+    }
+
+    auto record_bytes = tokenizer.decode(record_tokens);
+    checks.expect(!record.empty() && lfm2::lfm2_take_text(record_bytes) == text, "the artifact's tokens are the reply's text");
+    checks.expect(has_audio && speaking * 1920 == reply.audio_output->samples.size(), "the artifact's frames are the reply's speech",
+        std::to_string(speaking) + " frames");
+    checks.expect(!turn_1.output_artifacts.empty() && turn_1.output_artifacts[0].meta.at("ended") == (reply_cut ? "false" : "true"),
+        "the artifact says whether the reply ended");
+
+    // The second turn sends the first question's WAV and that artifact back.
+    // It sees the first turn: its reply differs from the one the same request
+    // gets without it.
+    const auto follow_up = engine::audio::read_wav_f32(repo_path(kFollowUp));
+    std::vector<engine::runtime::VoiceArtifact> history = {
+        engine::runtime::make_voice_artifact(engine::runtime::ArtifactKind::Custom, lfm2::kLfm2QuestionArtifactId, file_bytes(repo_path(kAudio)))};
+    if (!turn_1.output_artifacts.empty()) {
+        history.push_back(turn_1.output_artifacts[0]);
+    }
+
+    const auto second_turn = [&](std::vector<engine::runtime::VoiceArtifact> earlier) {
+        engine::runtime::TaskRequest request;
+        request.audio_input = engine::runtime::AudioBuffer{follow_up.sample_rate, follow_up.channels, follow_up.samples};
+        request.options["seed"] = kReplySeeds[0];
+        request.options["return_codes"] = "true";
+        request.input_artifacts = std::move(earlier);
+        return request;
+    };
+    const auto turn_2 = run(*s2s, second_turn(history));
+    const auto alone = run(*s2s, second_turn({}));
+    const std::string turn_2_text = turn_2.text_output.has_value() ? turn_2.text_output->text : "";
+    std::cout << "second turn: " << turn_2_text << "\n";
+    checks.expect(!words(turn_2_text).empty() && turn_2.audio_output.has_value() && !turn_2.audio_output->samples.empty() &&
+                      turn_2.output_artifacts.size() == 1,
+        "the second turn replies with text, speech and its artifact");
+    checks.expect(!same_reply(turn_2, alone), "the first turn changes the second turn's reply");
+    checks.expect(same_reply(run(*s2s, second_turn(history)), turn_2), "the second turn again gives the same bytes");
+
+    // The second reply's artifact replays in turn: a third turn, the first
+    // question again, after both.
+    if (!turn_2.output_artifacts.empty()) {
+        history.push_back(engine::runtime::make_voice_artifact(
+            engine::runtime::ArtifactKind::Custom, lfm2::kLfm2QuestionArtifactId, file_bytes(repo_path(kFollowUp))));
+        history.push_back(turn_2.output_artifacts[0]);
+    }
+
+    auto turn_3_request = question();
+    turn_3_request.input_artifacts = history;
+    const auto turn_3 = run(*s2s, turn_3_request);
+    checks.expect(history.size() == 4 && turn_3.text_output.has_value() && !words(turn_3.text_output->text).empty() &&
+                      turn_3.audio_output.has_value() && !turn_3.audio_output->samples.empty(),
+        "a third turn replays both earlier turns");
+    std::cout << "third turn: " << (turn_3.text_output.has_value() ? turn_3.text_output->text : "") << "\n";
 
     // Streamed with the same seed: the same reply, its audio decoded a frame
     // at a time. The other sessions go first, so one set of weights is loaded.
@@ -731,6 +918,8 @@ int main(int argc, char ** argv) {
             } else {
                 std::cout << "SKIP stage numbers: " << model_gguf << " is quantized\n";
             }
+
+            check_text_sampling(*components, *output, backend, checks);
         }
 
         check_replies(model_dir, spec_override, model_gguf, backend, full_precision, checks);

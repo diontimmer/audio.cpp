@@ -133,6 +133,15 @@ IndexTTS2Request parse_index_tts2_request(const runtime::TaskRequest & request) 
         }
         out.interval_silence_ms = *value;
     }
+    if (const auto value = runtime::parse_int_option(request.options, {"text_chunk_tokens"})) {
+        if (*value <= 0 || *value > 600) {
+            throw std::runtime_error("IndexTTS2 text_chunk_tokens must be between 1 and 600");
+        }
+        out.text_chunk_tokens = *value;
+    }
+    if (const auto value = runtime::find_option(request.options, {"text_normalization"})) {
+        out.text_normalization = runtime::parse_bool_option(*value, "text_normalization");
+    }
     if (request.audio_input.has_value()) {
         require_valid_audio(*request.audio_input, "emotion reference");
         out.emotion_audio = request.audio_input;
@@ -168,7 +177,7 @@ IndexTTS2Request parse_index_tts2_request(const runtime::TaskRequest & request) 
         }
         out.generation.max_mel_tokens = *value;
     }
-    if (const auto value = runtime::parse_finite_float_option(request.options, {"duration_factor"})) {
+    if (const auto value = runtime::parse_finite_float_option(request.options, {"duration_scale", "duration_factor"})) {
         out.generation.duration_factor = *value;
     }
     if (const auto value = runtime::parse_u32_option(request.options, {"seed"})) {
@@ -190,7 +199,7 @@ IndexTTS2Request parse_index_tts2_request(const runtime::TaskRequest & request) 
         throw std::runtime_error("IndexTTS2 num_beams must be positive");
     }
     if (!(out.generation.duration_factor > 0.0F)) {
-        throw std::runtime_error("IndexTTS2 duration_factor must be positive");
+        throw std::runtime_error("IndexTTS2 duration_scale must be positive");
     }
     return out;
 }

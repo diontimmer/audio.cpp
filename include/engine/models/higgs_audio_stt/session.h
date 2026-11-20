@@ -4,6 +4,7 @@
 #include "engine/framework/runtime/model.h"
 #include "engine/framework/assets/tensor_source.h"
 #include "engine/framework/runtime/session_base.h"
+#include "engine/framework/runtime/streaming_asr_session.h"
 #include "engine/models/higgs_audio_stt/assets.h"
 #include "engine/models/higgs_audio_stt/audio_encoder.h"
 #include "engine/models/higgs_audio_stt/frontend_whisper.h"
@@ -25,7 +26,7 @@ std::shared_ptr<runtime::IVoiceModelLoader> make_higgs_audio_stt_loader();
 class HiggsAudioSTTSession final
     : public runtime::RuntimeSessionBase
     , public runtime::IOfflineVoiceTaskSession
-    , public runtime::IStreamingVoiceTaskSession {
+    , public runtime::StreamingAsrSessionBase {
 public:
     HiggsAudioSTTSession(
         runtime::TaskSpec task,
@@ -40,14 +41,12 @@ public:
     void prepare(const runtime::SessionPreparationRequest & request) override;
     runtime::TaskResult run(const runtime::TaskRequest & request) override;
     runtime::StreamingPolicy streaming_policy() const override;
-    void start_stream(const runtime::TaskRequest & request) override;
-    void set_stream_event_sink(runtime::StreamEventCallback sink) override;
-    void reset() override;
-    runtime::StreamEvent process_audio_chunk(const runtime::AudioChunk & chunk) override;
-    runtime::TaskResult finish_stream() override;
-    runtime::TaskResult finalize() override;
 
 private:
+    void begin_stream(const runtime::TaskRequest & request) override;
+    void reset_stream_state() override;
+    void consume_audio(const runtime::AudioChunk & chunk) override;
+    void complete_stream(runtime::TaskResult & result) override;
     struct AudioChunkPlan {
         runtime::TimeSpan source_span;
     };
@@ -59,14 +58,10 @@ private:
     runtime::TaskSpec task_;
     std::shared_ptr<const HiggsAudioSTTAssets> assets_;
     std::shared_ptr<const engine::model_spec::ModelContract> contract_;
-    size_t audio_encoder_graph_arena_bytes_ = 512ull * 1024ull * 1024ull;
-    size_t text_decoder_prefill_graph_arena_bytes_ = 512ull * 1024ull * 1024ull;
-    size_t text_decoder_decode_graph_arena_bytes_ = 256ull * 1024ull * 1024ull;
-#if defined(INTPTR_MAX) && (INTPTR_MAX == INT32_MAX)
-    size_t text_decoder_weight_context_bytes_ = 1024ull * 1024ull * 1024ull;
-#else
-    size_t text_decoder_weight_context_bytes_ = 4096ull * 1024ull * 1024ull;
-#endif
+    size_t audio_encoder_graph_arena_bytes_ = 32ull * 1024ull * 1024ull;
+    size_t text_decoder_prefill_graph_arena_bytes_ = 32ull * 1024ull * 1024ull;
+    size_t text_decoder_decode_graph_arena_bytes_ = 32ull * 1024ull * 1024ull;
+    size_t text_decoder_weight_context_bytes_ = 8ull * 1024ull * 1024ull;
     engine::assets::TensorStorageType audio_encoder_weight_storage_type_ = engine::assets::TensorStorageType::Native;
     engine::assets::TensorStorageType text_decoder_weight_storage_type_ = engine::assets::TensorStorageType::Native;
     HiggsAudioSTTTextTokenizer tokenizer_;
@@ -76,9 +71,6 @@ private:
     HiggsAudioSTTPromptBuilder prompt_builder_;
     HiggsAudioSTTPostprocessor postprocessor_;
     runtime::TaskRequest streaming_request_;
-    runtime::TaskResult streaming_result_;
-    runtime::StreamEventCallback stream_event_sink_;
-    bool stream_started_ = false;
     int64_t streaming_chunks_processed_ = 0;
 };
 

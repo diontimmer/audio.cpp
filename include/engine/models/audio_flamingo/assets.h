@@ -19,6 +19,17 @@ enum class AudioFlamingoVariant {
     Next,
 };
 
+struct AudioFlamingoImplementation {
+    AudioFlamingoVariant variant;
+    int64_t default_max_audio_length_sec;
+    bool use_rote;
+    bool frame_audio_tokens;
+    bool allow_temporal_grounding;
+};
+
+extern const AudioFlamingoImplementation kAudioFlamingoV3Implementation;
+extern const AudioFlamingoImplementation kAudioFlamingoNextImplementation;
+
 struct AudioFlamingoFrontendConfig {
     int sample_rate = 16000;
     int64_t feature_size = 128;
@@ -62,7 +73,7 @@ struct AudioFlamingoRoTEConfig {
 };
 
 struct AudioFlamingoConfig {
-    AudioFlamingoVariant variant = AudioFlamingoVariant::V3;
+    const AudioFlamingoImplementation *impl = &kAudioFlamingoV3Implementation;
     int64_t max_new_tokens = 512;
     bool projector_bias = true;
     AudioFlamingoFrontendConfig frontend;
@@ -78,5 +89,8 @@ struct AudioFlamingoAssets {
 };
 
 std::shared_ptr<const AudioFlamingoAssets> load_audio_flamingo_assets(const std::filesystem::path & model_path);
+std::shared_ptr<const AudioFlamingoAssets> load_audio_flamingo_adapter(
+    std::shared_ptr<const AudioFlamingoAssets> assets,
+    const std::filesystem::path & path, float strength);
 
 }  // namespace engine::models::audio_flamingo

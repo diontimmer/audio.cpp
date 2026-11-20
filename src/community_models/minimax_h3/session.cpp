@@ -159,7 +159,7 @@ MiniMaxH3GenerateRequest MiniMaxH3Session::make_request(const runtime::TaskReque
     out.width = runtime::parse_int_option(request.options, {"width"}).value_or(assets_->config.width);
     out.num_frames = runtime::parse_int_option(request.options, {"num_frames"}).value_or(assets_->config.num_frames);
     out.guidance_scale = runtime::parse_float_option(request.options, {"guidance_scale"}).value_or(out.guidance_scale);
-    if (const auto value = runtime::find_option(request.options, {"sampler", "minimax_h3.sampler"})) {
+    if (const auto value = runtime::find_option(request.options, {"sampler_mode", "sampler", "minimax_h3.sampler"})) {
         out.sampler = parse_sampler_mode(*value);
     }
     out.flow_shift = runtime::parse_float_option(request.options, {"flow_shift"}).value_or(out.flow_shift);
@@ -248,6 +248,19 @@ std::shared_ptr<runtime::IVoiceModelLoader> make_minimax_h3_loader() {
     config.family = kFamily;
     config.load_assets = load_minimax_h3_assets;
     config.create_session = create_minimax_h3_session;
+    config.package_load = [](const assets::ModelPackage & package) {
+        runtime::PackageLoadTarget out{kFamily, package.root, {}, {}};
+        if (package.format == "gguf") {
+            for (const auto & file : package.files) {
+                if (file.filename() == "dit.gguf" || file.filename() == "dit_int8.gguf") {
+                    out.model_path = package.root / file;
+                    return out;
+                }
+            }
+            throw std::runtime_error("MiniMax-H3 GGUF package has no dit.gguf or dit_int8.gguf entry");
+        }
+        return out;
+    };
     return runtime::make_spec_backed_voice_loader(std::move(config));
 }
 

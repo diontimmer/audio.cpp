@@ -128,6 +128,7 @@ public:
     }
 
     runtime::TaskResult run(const runtime::TaskRequest & request) override {
+        const auto wall_start = std::chrono::steady_clock::now();
         require_prepared("builtin_audio_utils run");
         if (!request.audio_input.has_value()) {
             throw std::runtime_error("builtin_audio_utils requires --audio");
@@ -167,6 +168,7 @@ public:
         engine::debug::timing_log_scalar(
             "builtin_audio_utils." + operation_name(info_.kind) + "_ms",
             engine::debug::elapsed_ms(compute_start));
+        engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(wall_start));
         return result;
     }
 
@@ -222,16 +224,6 @@ public:
         inspection.discovered_weights.push_back(runtime::NamedAsset{
             model_id,
             asset});
-        inspection.cli.request_options.push_back(runtime::CliOptionInfo{
-            "audio",
-            "wav",
-            "Input WAV audio to process.",
-            true});
-        inspection.cli.request_options.push_back(runtime::CliOptionInfo{
-            "out",
-            "wav",
-            "Output WAV path.",
-            true});
         inspection.cli.load_options.push_back(runtime::CliOptionInfo{
             "utility",
             "utility-id",

@@ -2,9 +2,11 @@
 
 #include "engine/framework/assets/tensor_source.h"
 #include "engine/framework/core/module.h"
+#include "engine/framework/core/backend.h"
 #include "engine/framework/modules/conditioning_modules.h"
 #include "engine/framework/modules/conv_modules.h"
 #include "engine/framework/modules/linear_module.h"
+#include "engine/framework/modules/feed_forward_modules.h"
 #include "engine/framework/modules/norm_modules.h"
 #include "engine/framework/modules/recurrent_modules.h"
 #include "engine/framework/modules/streaming_conv_modules.h"
@@ -378,6 +380,34 @@ LinearWeights linear_from_source(
         weights.bias = store.load_f32_tensor(source, prefix + ".bias", {out_features});
     }
     return weights;
+}
+
+// Resolve and materialize FFN operands once in the session's weight store.
+// The matching graph precision policy is implemented by FeedForwardModule.
+template <typename Store>
+FeedForwardWeights feed_forward_from_source(
+    Store & store, const assets::TensorSource & source, const FeedForwardWeightNames & names,
+    const FeedForwardConfig & config, assets::TensorStorageType storage, core::BackendType backend) {
+    const bool autocast = config.precision_policy == FeedForwardPrecisionPolicy::Bf16Autocast;
+    if (autocast && config.projection_precision == GGML_PREC_DEFAULT &&
+        storage == assets::TensorStorageType::Native && backend == core::BackendType::Cuda &&
+        assets::resolve_tensor_storage_type(source, names.fc1_weight, storage) == assets::TensorStorageType::BF16)
+        storage = assets::TensorStorageType::F16;
+    const auto load = [&](const std::string & weight, const std::string & bias, int64_t out, int64_t in) {
+        auto type = storage;
+        if (autocast && type == assets::TensorStorageType::Native && backend == core::BackendType::Vulkan)
+            type = assets::resolve_tensor_storage_type(source, weight, type);
+        LinearWeights parameters{store.load_tensor(source, weight, type, {out, in}), std::nullopt};
+        if (config.use_bias) {
+            auto values = source.require_f32(bias, {out});
+            if (autocast) core::round_f32_to_bf16_in_place(values);
+            parameters.bias = store.make_f32(core::TensorShape::from_dims({out}), std::move(values));
+        }
+        return parameters;
+    };
+    const auto up = load(names.fc1_weight, names.fc1_bias, config.intermediate_size, config.hidden_size);
+    const auto down = load(names.fc2_weight, names.fc2_bias, config.hidden_size, config.intermediate_size);
+    return {up.weight, up.bias, down.weight, down.bias};
 }
 
 template <typename Store>
@@ -759,11 +789,29 @@ ConvTranspose1dWeights conv_transpose1d_from_named_source(
     const assets::TensorSource & source,
     const std::string & weight_name,
     const std::optional<std::string> & bias_name,
-    assets::TensorStorageType storage_type) {
+    assets::TensorStorageType storage_type,
+    bool prepack_col2im = false) {
     ConvTranspose1dWeights weights;
     weights.weight = tensor_from_named_source(store, source, weight_name, storage_type);
     if (bias_name.has_value()) {
         weights.bias = f32_tensor_from_named_source(store, source, *bias_name);
+    }
+    if (prepack_col2im) {
+        core::validate_rank_between(weights.weight, 3, 3, "conv_transpose1d weight");
+        const auto & shape = weights.weight.shape;
+        const int64_t inputs = shape.dims[0], outputs = shape.dims[1], kernel = shape.dims[2];
+        const auto values = assets::tensor_data_to_f32(weight_name,
+            source.require_tensor(weight_name, storage_type, {inputs, outputs, kernel}));
+        std::vector<float> matrix(values.size());
+        for (int64_t output = 0; output < outputs; ++output) {
+            for (int64_t tap = 0; tap < kernel; ++tap) {
+                for (int64_t input = 0; input < inputs; ++input) {
+                    matrix[static_cast<size_t>((output * kernel + tap) * inputs + input)] =
+                        values[static_cast<size_t>((input * outputs + output) * kernel + tap)];
+                }
+            }
+        }
+        weights.col2im_matrix = store.make_f32(core::TensorShape::from_dims({outputs * kernel, inputs}), std::move(matrix));
     }
     return weights;
 }

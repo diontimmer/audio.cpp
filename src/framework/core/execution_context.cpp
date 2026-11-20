@@ -1,12 +1,14 @@
 #include "engine/framework/core/execution_context.h"
 
+#include <cmath>
+#include <stdexcept>
 #include <utility>
 
 namespace engine::core {
 
 ExecutionContext::ExecutionContext(const BackendConfig & config)
-    : config_(config),
-      backend_(init_backend(config)) {
+    : config_(config) {
+    backend_ = init_backend(config);
     if (backend_ != nullptr && config_.threads > 0) {
         set_backend_threads(backend_, config_.threads);
     }
@@ -20,7 +22,7 @@ ExecutionContext::~ExecutionContext() {
 }
 
 ExecutionContext::ExecutionContext(ExecutionContext && other) noexcept
-    : config_(other.config_),
+    : config_(std::move(other.config_)),
       backend_(other.backend_) {
     other.backend_ = nullptr;
 }
@@ -32,7 +34,7 @@ ExecutionContext & ExecutionContext::operator=(ExecutionContext && other) noexce
     if (backend_ != nullptr) {
         ggml_backend_free(backend_);
     }
-    config_ = other.config_;
+    config_ = std::move(other.config_);
     backend_ = other.backend_;
     other.backend_ = nullptr;
     return *this;

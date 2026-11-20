@@ -1,12 +1,14 @@
 #include "engine/community_models/sense_asr/session.h"
+#include "engine/community_models/sense_asr/word_timestamps.h"
 
 #include "engine/framework/audio/chunking.h"
 #include "engine/framework/audio/conversion.h"
 #include "engine/framework/debug/profiler.h"
+#include "engine/framework/decoders/ctc_host_decoder.h"
 #include "engine/framework/io/text.h"
 #include "engine/framework/runtime/options.h"
 #include "engine/framework/runtime/spec_backed_model.h"
-#include "engine/models/silero_vad/session.h"
+#include "engine/framework/runtime/registry.h"
 
 #include <algorithm>
 #include <chrono>
@@ -140,29 +142,21 @@ SenseAsrDecodedTokens decode_ctc(const std::vector<float> &logits,
                                  int64_t frames, int64_t vocab_size,
                                  int64_t blank_id,
                                  const std::vector<std::string> &vocab,
-                                 bool keep_tags) {
+                                 bool keep_tags, bool timestamps,
+                                 int64_t prefix_frames) {
   SenseAsrDecodedTokens decoded;
   if (frames <= 0 || vocab_size <= 0) {
     return decoded;
   }
   std::vector<int32_t> ids;
   ids.reserve(static_cast<size_t>(frames));
-  int32_t previous = -1;
-  for (int64_t frame = 0; frame < frames; ++frame) {
-    const float *column = logits.data() + static_cast<size_t>(frame) *
-                                              static_cast<size_t>(vocab_size);
-    int32_t argmax = 0;
-    float best = column[0];
-    for (int64_t token = 1; token < vocab_size; ++token) {
-      if (column[token] > best) {
-        best = column[token];
-        argmax = static_cast<int32_t>(token);
-      }
-    }
-    if (argmax != previous && argmax != blank_id) {
-      ids.push_back(argmax);
-    }
-    previous = argmax;
+  const auto frame_ids = decoders::CtcHostDecoder::frame_ids(logits.data(), frames, vocab_size);
+  const auto spans = decoders::CtcHostDecoder(static_cast<int32_t>(blank_id)).decode(frame_ids);
+  for (const auto & span : spans) {
+    ids.push_back(span.id);
+  }
+  if (timestamps && !vocab.empty()) {
+    decoded.words = group_words(spans, vocab, prefix_frames);
   }
   if (std::getenv("SENSE_ASR_DUMP_IDS") != nullptr) {
     std::string s = "ids(" + std::to_string(frames) + "):";
@@ -179,14 +173,8 @@ SenseAsrDecodedTokens decode_ctc(const std::vector<float> &logits,
          ++frame) {
       const float *column = logits.data() + static_cast<size_t>(frame) *
                                                 static_cast<size_t>(vocab_size);
-      int32_t argmax = 0;
-      float best = column[0];
-      for (int64_t token = 1; token < vocab_size; ++token) {
-        if (column[token] > best) {
-          best = column[token];
-          argmax = static_cast<int32_t>(token);
-        }
-      }
+      const int32_t argmax = frame_ids[static_cast<size_t>(frame)];
+      const float best = column[argmax];
       fprintf(stderr, "frame %lld: argmax=%d (%.4f)\n", (long long)frame,
               argmax, best);
     }
@@ -276,6 +264,14 @@ query_tokens(const SenseAsrTranscriptionOptions &transcription,
   return tokens;
 }
 
+// Moves words timed within a slice of the audio to the whole audio's time.
+void shift_words(std::vector<runtime::WordTimestamp> &words, int64_t offset) {
+  for (auto &word : words) {
+    word.span.start_sample += offset;
+    word.span.end_sample += offset;
+  }
+}
+
 std::filesystem::path default_vad_model_path() {
   return std::filesystem::path("assets") / "framework" / "models" /
          "silero_vad";
@@ -339,7 +335,9 @@ runtime::TaskResult SenseAsrSession::run(const runtime::TaskRequest &request) {
     auto item = normalized_request;
     item.audio_input =
         engine::audio::slice_audio_buffer(audio, chunks.front().source_span);
-    return run_single(make_request(item));
+    auto result = run_single(make_request(item));
+    shift_words(result.word_timestamps, chunks.front().source_span.start_sample);
+    return result;
   }
 
   runtime::TaskResult merged;
@@ -348,7 +346,11 @@ runtime::TaskResult SenseAsrSession::run(const runtime::TaskRequest &request) {
     auto item = normalized_request;
     item.audio_input =
         engine::audio::slice_audio_buffer(audio, chunk.source_span);
-    const auto result = run_single(make_request(item));
+    auto result = run_single(make_request(item));
+    shift_words(result.word_timestamps, chunk.source_span.start_sample);
+    merged.word_timestamps.insert(merged.word_timestamps.end(),
+                                  result.word_timestamps.begin(),
+                                  result.word_timestamps.end());
     if (result.text_output.has_value()) {
       append_chunk_text(text, result.text_output->text);
       if (!merged.text_output.has_value()) {
@@ -374,51 +376,28 @@ runtime::StreamingPolicy SenseAsrSession::streaming_policy() const {
   return policy;
 }
 
-void SenseAsrSession::start_stream(const runtime::TaskRequest &request) {
+void SenseAsrSession::begin_stream(const runtime::TaskRequest &request) {
   require_prepared("SenseVoice start_stream()");
-  if (task_.mode != runtime::RunMode::Streaming) {
-    throw std::runtime_error(
-        "SenseVoice start_stream() requires a streaming session");
-  }
-  reset();
   streaming_request_ = request;
   streaming_request_.options =
       normalize_request_options(request.options, *contract_);
   if (streaming_request_.audio_input.has_value()) {
     streaming_request_.audio_input->samples.clear();
   }
-  stream_started_ = true;
-  stream_wall_start_ = Clock::now();
 }
 
-void SenseAsrSession::set_stream_event_sink(runtime::StreamEventCallback sink) {
-  stream_event_sink_ = std::move(sink);
-}
-
-void SenseAsrSession::reset() {
+void SenseAsrSession::reset_stream_state() {
   require_prepared("SenseVoice reset()");
   streaming_request_ = runtime::TaskRequest{};
-  streaming_result_ = runtime::TaskResult{};
   streaming_audio_ = runtime::AudioBuffer{};
   streaming_audio_offset_values_ = 0;
-  streaming_text_.clear();
-  streaming_published_bytes_ = 0;
   streaming_windows_processed_ = 0;
-  stream_started_ = false;
-  stream_wall_start_ = {};
+  streaming_frames_done_ = 0;
 }
 
-runtime::StreamEvent
-SenseAsrSession::process_audio_chunk(const runtime::AudioChunk &chunk) {
+void
+SenseAsrSession::consume_audio(const runtime::AudioChunk &chunk) {
   require_prepared("SenseVoice process_audio_chunk()");
-  if (task_.mode != runtime::RunMode::Streaming) {
-    throw std::runtime_error(
-        "SenseVoice process_audio_chunk() requires a streaming session");
-  }
-  if (!stream_started_) {
-    throw std::runtime_error(
-        "SenseVoice process_audio_chunk() requires start_stream");
-  }
   runtime::AudioBuffer audio;
   audio.sample_rate = chunk.sample_rate;
   audio.channels = chunk.channels;
@@ -434,21 +413,12 @@ SenseAsrSession::process_audio_chunk(const runtime::AudioChunk &chunk) {
     streaming_audio_offset_values_ = 0;
   }
   runtime::append_audio_buffer(streaming_audio_, audio);
-  return process_available_stream_chunks(false);
+  process_available_stream_chunks(false);
 }
 
-runtime::TaskResult SenseAsrSession::finish_stream() { return finalize(); }
-
-runtime::TaskResult SenseAsrSession::finalize() {
+void SenseAsrSession::complete_stream(runtime::TaskResult &) {
   const auto finalize_start = Clock::now();
   require_prepared("SenseVoice finalize()");
-  if (task_.mode != runtime::RunMode::Streaming) {
-    throw std::runtime_error(
-        "SenseVoice finalize() requires a streaming session");
-  }
-  if (!stream_started_) {
-    throw std::runtime_error("SenseVoice finalize() requires start_stream");
-  }
   if (streaming_audio_offset_values_ > streaming_audio_.samples.size()) {
     throw std::runtime_error(
         "SenseVoice streaming pending audio offset is out of range");
@@ -457,28 +427,15 @@ runtime::TaskResult SenseAsrSession::finalize() {
       streaming_windows_processed_ == 0) {
     throw std::runtime_error("SenseVoice finalize() requires streamed audio");
   }
-  (void)process_available_stream_chunks(true);
-  if (!streaming_result_.text_output.has_value()) {
-    streaming_result_.text_output = runtime::Transcript{"", ""};
-  }
-  stream_started_ = false;
-  if (stream_event_sink_ != nullptr) {
-    runtime::StreamEvent event;
-    event.is_final = true;
-    stream_event_sink_(event);
-  }
+  process_available_stream_chunks(true);
+  runtime::AsrStreamMetadata event;
+  event.is_final = true;
+  publish_metadata(std::move(event));
   engine::debug::timing_log_scalar("sense_asr.session.stream.windows",
                                    streaming_windows_processed_);
   engine::debug::timing_log_scalar("sense_asr.session.stream.finalize_ms",
                                    engine::debug::elapsed_ms(finalize_start));
-  if (stream_wall_start_ != std::chrono::steady_clock::time_point{}) {
-    engine::debug::timing_log_scalar(
-        "sense_asr.session.stream.wall_ms",
-        engine::debug::elapsed_ms(stream_wall_start_));
-    engine::debug::timing_log_scalar(
-        "session.wall_ms", engine::debug::elapsed_ms(stream_wall_start_));
-  }
-  return streaming_result_;
+  engine::debug::timing_log_scalar("sense_asr.session.stream.wall_ms", stream_wall_ms());
 }
 
 SenseAsrSession::AsrRequest
@@ -500,6 +457,11 @@ SenseAsrSession::make_request(const runtime::TaskRequest &request) const {
   if (const auto value = runtime::find_option(request.options, {"keep_tags"})) {
     out.transcription.keep_tags =
         runtime::parse_bool_option(*value, "keep_tags");
+  }
+  if (const auto value =
+          runtime::find_option(request.options, {"return_timestamps"})) {
+    out.transcription.return_timestamps =
+        runtime::parse_bool_option(*value, "return_timestamps");
   }
   return out;
 }
@@ -586,7 +548,7 @@ runtime::IOfflineVoiceTaskSession &SenseAsrSession::vad_session() {
     runtime::ModelLoadRequest load_request;
     load_request.model_path = vad_model_path_;
     vad_model_ =
-        engine::models::silero_vad::load_silero_vad_model(load_request);
+        runtime::load_vad_model(load_request);
     auto session = vad_model_->create_task_session(
         runtime::TaskSpec{runtime::VoiceTaskKind::Vad,
                           runtime::RunMode::Offline},
@@ -619,8 +581,9 @@ runtime::TaskResult SenseAsrSession::run_single(const AsrRequest &request) {
   const auto frontend_end = Clock::now();
 
   const auto encoder_start = Clock::now();
-  encoder_.set_query_tokens(query_tokens(request.transcription,
-                                         assets_->config.encoder.query_tokens));
+  const auto queries = query_tokens(request.transcription,
+                                    assets_->config.encoder.query_tokens);
+  encoder_.set_query_tokens(queries);
   const auto encoded = encoder_.encode(features);
   const auto encoder_end = Clock::now();
 
@@ -628,11 +591,19 @@ runtime::TaskResult SenseAsrSession::run_single(const AsrRequest &request) {
   const auto decoded =
       decode_ctc(encoded.logits, encoded.frames, encoded.vocab_size,
                  assets_->config.encoder.blank_id, assets_->config.vocab,
-                 request.transcription.keep_tags);
+                 request.transcription.keep_tags,
+                 request.transcription.return_timestamps,
+                 static_cast<int64_t>(queries.size()));
   const auto decode_end = Clock::now();
 
   runtime::TaskResult result;
   result.text_output = runtime::Transcript{decoded.text, decoded.language};
+  if (!decoded.words.empty()) {
+    const auto &frontend = assets_->config.frontend;
+    result.word_timestamps = word_timestamps_from_frames(
+        decoded.words, frontend.frame_shift_ms * frontend.lfr_n,
+        request.audio.sample_rate, audio_frame_count(request.audio));
+  }
 
   debug::timing_log_scalar("sense_asr.resample_ms",
                            debug::elapsed_ms(resample_start, resample_end));
@@ -651,12 +622,10 @@ runtime::TaskResult SenseAsrSession::run_single(const AsrRequest &request) {
   return result;
 }
 
-runtime::StreamEvent
+void
 SenseAsrSession::process_available_stream_chunks(bool final) {
-  runtime::StreamEvent last_event;
-  last_event.is_final = false;
   if (streaming_audio_.sample_rate <= 0 || streaming_audio_.channels <= 0) {
-    return last_event;
+    return;
   }
   if (streaming_audio_offset_values_ > streaming_audio_.samples.size()) {
     throw std::runtime_error(
@@ -708,13 +677,9 @@ SenseAsrSession::process_available_stream_chunks(bool final) {
     chunk.samples.assign(begin,
                          begin + static_cast<std::ptrdiff_t>(take_values));
     streaming_audio_offset_values_ += take_values;
-    last_event = process_one_stream_chunk(chunk);
+    process_one_stream_chunk(chunk);
     ++streaming_windows_processed_;
     ++processed_chunks;
-    if (stream_event_sink_ != nullptr && last_event.partial_text.has_value()) {
-      stream_event_sink_(last_event);
-      last_event.partial_text.reset();
-    }
   }
   if (processed_chunks > 0) {
     if (streaming_audio_offset_values_ == streaming_audio_.samples.size()) {
@@ -730,42 +695,36 @@ SenseAsrSession::process_available_stream_chunks(bool final) {
       streaming_audio_offset_values_ = 0;
     }
   }
-  return last_event;
 }
 
-runtime::StreamEvent
+void
 SenseAsrSession::process_one_stream_chunk(const runtime::AudioBuffer &audio) {
   runtime::TaskRequest item_request = streaming_request_;
   item_request.audio_input = audio;
   item_request.options["audio_chunk_mode"] = "none";
   auto item = run_single(make_request(item_request));
+  const int64_t offset = streaming_frames_done_;
+  streaming_frames_done_ += audio_frame_count(audio);
 
-  runtime::StreamEvent event;
-  event.is_final = false;
   if (!item.text_output.has_value() || item.text_output->text.empty()) {
-    return event;
+    return;
   }
-  const std::string delta = item.text_output->text;
-  if (streaming_text_.empty()) {
-    streaming_text_ = delta;
+  // Windows are final once decoded, so only the new text and words are
+  // appended; the committed transcript is joined as before.
+  const auto &committed = committed_transcript();
+  runtime::Transcript segment;
+  if (committed.text.empty()) {
+    segment.text = item.text_output->text;
   } else {
-    append_chunk_text(streaming_text_, delta);
+    std::string joined = committed.text;
+    append_chunk_text(joined, item.text_output->text);
+    segment.text = joined.substr(committed.text.size());
   }
-  if (!streaming_result_.text_output.has_value()) {
-    streaming_result_.text_output =
-        runtime::Transcript{"", item.text_output->language};
-  } else if (streaming_result_.text_output->language.empty()) {
-    streaming_result_.text_output->language = item.text_output->language;
+  if (committed.language.empty()) {
+    segment.language = item.text_output->language;
   }
-  streaming_result_.text_output->text = streaming_text_;
-  if (streaming_published_bytes_ < streaming_text_.size()) {
-    event.partial_text = runtime::Transcript{
-        streaming_text_.substr(streaming_published_bytes_),
-        streaming_result_.text_output->language,
-    };
-    streaming_published_bytes_ = streaming_text_.size();
-  }
-  return event;
+  shift_words(item.word_timestamps, offset);
+  append_transcript(std::move(segment), std::move(item.word_timestamps));
 }
 
 std::shared_ptr<runtime::IVoiceModelLoader> make_sense_asr_loader() {

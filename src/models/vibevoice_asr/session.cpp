@@ -4,9 +4,10 @@
 #include "engine/framework/debug/profiler.h"
 #include "engine/framework/debug/trace.h"
 #include "engine/framework/runtime/options.h"
+#include "engine/framework/runtime/model_routing.h"
 #include "engine/framework/runtime/partial_text.h"
 #include "engine/framework/sampling/torch_random.h"
-#include "engine/models/silero_vad/session.h"
+#include "engine/framework/runtime/registry.h"
 
 #include <ggml.h>
 
@@ -31,15 +32,10 @@ namespace engine::models::vibevoice_asr {
 namespace {
 
 using Clock = std::chrono::steady_clock;
-constexpr size_t kDefaultTokenizerWeightContextBytes = 512ull * 1024ull * 1024ull;
-constexpr size_t kDefaultConnectorWeightContextBytes = 128ull * 1024ull * 1024ull;
-#if defined(INTPTR_MAX) && (INTPTR_MAX == INT32_MAX)
-constexpr size_t kDefaultDecoderWeightContextBytes = 1024ull * 1024ull * 1024ull;
-#else
-constexpr size_t kDefaultDecoderWeightContextBytes = 4096ull * 1024ull * 1024ull;
-#endif
+constexpr size_t kDefaultTokenizerWeightContextBytes = 8ull * 1024ull * 1024ull;
+constexpr size_t kDefaultConnectorWeightContextBytes = 8ull * 1024ull * 1024ull;
+constexpr size_t kDefaultDecoderWeightContextBytes = 8ull * 1024ull * 1024ull;
 constexpr double kDefaultAudioChunkSeconds = 20.0 * 60.0;
-constexpr int64_t kDefaultStreamingMaxTokensPerChunk = 256;
 constexpr int64_t kStreamingDecoderInitialCacheSteps = 1024;
 
 std::shared_ptr<const VibeVoiceASRAssets> require_assets(std::shared_ptr<const VibeVoiceASRAssets> assets) {
@@ -85,10 +81,6 @@ int64_t audio_frame_count(const runtime::AudioBuffer & audio) {
         throw std::runtime_error("VibeVoice-ASR audio samples must be divisible by channel count");
     }
     return static_cast<int64_t>(audio.samples.size() / static_cast<size_t>(audio.channels));
-}
-
-bool is_streaming_family(const VibeVoiceASRAssets & assets) {
-    return assets.family == "vibevoice_asr_streaming";
 }
 
 int64_t streaming_decoder_cache_capacity(int64_t max_position_embeddings, int64_t required_steps) {
@@ -533,6 +525,27 @@ int32_t sample_token(
 
 }  // namespace
 
+// Implementation registrations
+
+const VibeVoiceASRImplementation VibeVoiceASRImplementation::offline{
+    "vibevoice_asr", false, 32768, &VibeVoiceASRSession::run_offline_request};
+const VibeVoiceASRImplementation VibeVoiceASRImplementation::streaming_model{
+    "vibevoice_asr_streaming", true, 256, &VibeVoiceASRSession::run_streaming_model};
+
+namespace {
+using Entry = runtime::ModelRouteEntry<std::string, VibeVoiceASRImplementation>;
+const Entry entries[] = {
+    {VibeVoiceASRImplementation::offline.family, &VibeVoiceASRImplementation::offline},
+    {VibeVoiceASRImplementation::streaming_model.family, &VibeVoiceASRImplementation::streaming_model},
+};
+const runtime::ModelRouteTable<std::string, VibeVoiceASRImplementation> table(
+    "VibeVoice-ASR", entries);
+}  // namespace
+
+const VibeVoiceASRImplementation & require_vibevoice_asr_implementation(const std::string & family) {
+    return table.require(family);
+}
+
 VibeVoiceASRSession::VibeVoiceASRSession(
     runtime::TaskSpec task,
     runtime::SessionOptions options,
@@ -592,10 +605,10 @@ VibeVoiceASRSession::VibeVoiceASRSession(
     if (task_.task != runtime::VoiceTaskKind::Asr) {
         throw std::runtime_error("VibeVoice-ASR only supports the Asr task");
     }
-    if (!is_streaming_family(*assets_) && task_.mode != runtime::RunMode::Offline) {
+    if (!assets_->impl->streaming && task_.mode != runtime::RunMode::Offline) {
         throw std::runtime_error("VibeVoice-ASR streaming sessions are not supported");
     }
-    if (is_streaming_family(*assets_) && task_.mode != runtime::RunMode::Offline && task_.mode != runtime::RunMode::Streaming) {
+    if (assets_->impl->streaming && task_.mode != runtime::RunMode::Offline && task_.mode != runtime::RunMode::Streaming) {
         throw std::runtime_error("VibeVoice-ASR streaming model supports offline and streaming ASR only");
     }
     validate_weight_storage(tokenizer_weight_storage_type_, "vibevoice_asr.tokenizer_weight_type");
@@ -618,7 +631,7 @@ VibeVoiceASRSession::VibeVoiceASRSession(
 VibeVoiceASRSession::~VibeVoiceASRSession() = default;
 
 std::string VibeVoiceASRSession::family() const {
-    return assets_->family;
+    return assets_->family();
 }
 
 runtime::VoiceTaskKind VibeVoiceASRSession::task_kind() const {
@@ -642,9 +655,10 @@ runtime::TaskResult VibeVoiceASRSession::run(const runtime::TaskRequest & reques
     if (task_.mode != runtime::RunMode::Offline) {
         throw std::runtime_error("VibeVoice-ASR offline run called on non-offline session");
     }
-    if (is_streaming_family(*assets_)) {
-        return run_streaming_model(make_request(request));
-    }
+    return (this->*assets_->impl->run)(request);
+}
+
+runtime::TaskResult VibeVoiceASRSession::run_offline_request(const runtime::TaskRequest & request) {
     const auto chunks = audio_chunk_plan(request);
     if (chunks.empty()) {
         if (request.audio_input.has_value() &&
@@ -766,7 +780,7 @@ runtime::StreamEvent VibeVoiceASRSession::process_audio_chunk(const runtime::Aud
     audio.channels = chunk.channels;
     audio.samples = chunk.samples;
 
-    if (is_streaming_family(*assets_)) {
+    if (assets_->impl->streaming) {
         auto request = streaming_request_;
         request.audio_input = audio;
         auto asr_request = make_request(request);
@@ -857,7 +871,7 @@ runtime::TaskResult VibeVoiceASRSession::finalize() {
     if (!stream_started_) {
         throw std::runtime_error("VibeVoice-ASR finalize requires start_stream");
     }
-    if (is_streaming_family(*assets_) && !streaming_audio_buffer_.samples.empty()) {
+    if (assets_->impl->streaming && !streaming_audio_buffer_.samples.empty()) {
         auto request = streaming_request_;
         request.audio_input = streaming_audio_buffer_;
         auto asr_request = make_request(request);
@@ -889,7 +903,7 @@ VibeVoiceASRRequest VibeVoiceASRSession::make_request(const runtime::TaskRequest
     }
     VibeVoiceASRRequest out;
     out.audio = *request.audio_input;
-    out.generation.max_new_tokens = is_streaming_family(*assets_) ? kDefaultStreamingMaxTokensPerChunk : 32768;
+    out.generation.max_new_tokens = assets_->impl->default_max_tokens;
     if (request.text_input.has_value()) {
         out.context = request.text_input->text;
         out.language = request.text_input->language;
@@ -1015,7 +1029,7 @@ runtime::IOfflineVoiceTaskSession & VibeVoiceASRSession::vad_session() {
     if (vad_session_ == nullptr) {
         runtime::ModelLoadRequest load_request;
         load_request.model_path = vad_model_path_;
-        vad_model_ = engine::models::silero_vad::load_silero_vad_model(load_request);
+        vad_model_ = runtime::load_vad_model(load_request);
         auto session = vad_model_->create_task_session(
             runtime::TaskSpec{runtime::VoiceTaskKind::Vad, runtime::RunMode::Offline},
             runtime::SessionOptions{options().backend, {}});
@@ -1218,7 +1232,8 @@ runtime::StreamEvent VibeVoiceASRSession::process_streaming_model_normalized_chu
     return event;
 }
 
-runtime::TaskResult VibeVoiceASRSession::run_streaming_model(const VibeVoiceASRRequest & request) {
+runtime::TaskResult VibeVoiceASRSession::run_streaming_model(const runtime::TaskRequest & task_request) {
+    const auto request = make_request(task_request);
     const auto wall_start = Clock::now();
     const auto frontend_start = Clock::now();
     const auto audio = frontend_.normalize(request.audio);

@@ -3,6 +3,7 @@
 #include "engine/framework/core/backend.h"
 #include "engine/framework/core/backend_weight_store.h"
 #include "engine/framework/core/execution_context.h"
+#include "engine/framework/core/prepared_graph.h"
 #include "engine/framework/modules/linear_module.h"
 #include "engine/framework/modules/norm_modules.h"
 #include "engine/community_models/granite5asr/assets.h"
@@ -48,15 +49,22 @@ struct Granite5ConformerEncoderWeights {
     modules::LinearWeights out_mid;
 };
 
+// One greedy CTC frame. probability is the softmax of the winning class,
+// computed from logits that the encoder already materializes for the argmax.
+struct CtcArgmaxFrame {
+    int32_t id = 0;
+    float probability = 0.f;
+};
+
 class Granite5ConformerEncoderRuntime {
 public:
     Granite5ConformerEncoderRuntime(
         std::shared_ptr<const Granite5ASRAssets> assets,
         engine::core::ExecutionContext & execution_context,
         assets::TensorStorageType storage_type,
-        size_t graph_arena_bytes = 1024ull * 1024ull * 1024ull);
+        size_t graph_arena_bytes = 16ull * 1024ull * 1024ull);
 
-    std::vector<int32_t> transcribe_features(
+    std::vector<CtcArgmaxFrame> transcribe_features(
         const Granite5FrontendFeatures & features);
 
     const Granite5ASRAssets & assets() const noexcept { return *assets_; }
@@ -67,6 +75,12 @@ private:
     engine::core::BackendWeightStore weight_store_;
     Granite5ConformerEncoderWeights weights_;
     size_t graph_arena_bytes_;
+    int64_t graph_frames_ = 0;
+    ggml_tensor * input_ = nullptr;
+    core::TensorValue logits_;
+    std::vector<float> logits_data_;
+    // Keep only the most recent shape; graph teardown precedes weight teardown.
+    std::unique_ptr<core::PreparedGraph> graph_;
 };
 
 }  // namespace engine::community_models::granite5asr

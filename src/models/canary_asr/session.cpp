@@ -1,5 +1,7 @@
 #include "engine/models/canary_asr/model.h"
 
+#include "engine/framework/debug/profiler.h"
+
 #include "engine/framework/audio/chunking.h"
 #include "engine/framework/audio/conversion.h"
 #include "engine/framework/runtime/options.h"
@@ -32,12 +34,20 @@ public:
     runtime::VoiceTaskKind task_kind() const override { return runtime::VoiceTaskKind::Asr; }
     runtime::RunMode run_mode() const override { return runtime::RunMode::Offline; }
     void prepare(const runtime::SessionPreparationRequest & request) override {
-        runtime::validate_spec_backed_request_options(request.options, *contract_, "Canary ASR");
+        auto validation_options = request.options;
+        validation_options.erase("punc");
+        validation_options.erase("pnc");
+        (void)runtime::find_option(request.options, {"punc", "pnc"});
+        runtime::validate_spec_backed_request_options(validation_options, *contract_, "Canary ASR");
         mark_prepared();
     }
     runtime::TaskResult run(const runtime::TaskRequest & request) override {
+        const auto wall_start = std::chrono::steady_clock::now();
         require_prepared("Canary run");
-        runtime::validate_spec_backed_request_options(request.options, *contract_, "Canary ASR");
+        auto validation_options = request.options;
+        validation_options.erase("punc");
+        validation_options.erase("pnc");
+        runtime::validate_spec_backed_request_options(validation_options, *contract_, "Canary ASR");
         if (!request.audio_input) {
             throw std::runtime_error("Canary ASR requires audio input");
         }
@@ -48,7 +58,7 @@ public:
                 throw std::runtime_error("Canary supports en, de, es and fr");
             }
         }
-        const bool pnc = runtime::parse_bool_option(runtime::find_option(request.options, {"pnc"}).value_or("true"), "pnc");
+        const bool pnc = runtime::parse_bool_option(runtime::find_option(request.options, {"punc", "pnc"}).value_or("true"), "punc");
         const std::vector<std::string> prompt_text = {"<|startofcontext|>", "<|startoftranscript|>",
             "<|emo:undefined|>", "<|" + language + "|>", "<|" + target + "|>", pnc ? "<|pnc|>" : "<|nopnc|>",
             "<|noitn|>", "<|notimestamp|>", "<|nodiarize|>"};
@@ -112,6 +122,7 @@ public:
             trace(debug::LogLevel::Info, "canary_asr", "chunk=" + std::to_string(chunk.index) +
                 " samples=" + std::to_string(chunk.valid_samples) + " tokens=" + std::to_string(tokens.size()));
         }
+        engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(wall_start));
         return result;
     }
 

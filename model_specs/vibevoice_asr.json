@@ -138,7 +138,7 @@
         "description": "Context or graph arena size in MiB.",
         "required": false,
         "min": 1,
-        "default": 512
+        "default": 8
       },
       {
         "name": "connector_weight_context_mb",
@@ -146,26 +146,28 @@
         "description": "Context or graph arena size in MiB.",
         "required": false,
         "min": 1,
-        "default": 128
+        "default": 8
       },
       {
         "name": "decoder_weight_context_mb",
         "type": "int",
-        "description": "Decoder weight context in MiB; 4096 on 64-bit builds, 1024 on 32-bit builds.",
+        "description": "Decoder weight context in MiB; default 8.",
         "required": false,
-        "min": 1
+        "min": 1,
+        "default": 8
       },
       {
         "name": "max_history_steps",
         "type": "int",
-        "description": "Maximum retained decoder history; zero uses the model limit.",
+        "description": "Maximum retained decoder history; zero uses the model limit. Cannot exceed checkpoint position capacity; zero uses that capacity.",
         "required": false,
-        "default": 0
+        "default": 0,
+        "min": 0
       },
       {
         "name": "vad_model_path",
         "type": "path",
-        "description": "Silero VAD model used with audio_chunk_mode=vad.",
+        "description": "VAD model (any built-in VAD family; default Silero VAD) used with audio_chunk_mode=vad.",
         "required": false,
         "default": "assets/framework/models/silero_vad"
       }

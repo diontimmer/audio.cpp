@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/framework/runtime/session.h"
+#include "engine/framework/codecs/qwen3_audio_tokenizer_runtime.h"
 
 #include <cstdint>
 #include <optional>
@@ -18,6 +19,7 @@ enum class Qwen3TTSVariant {
 enum class Qwen3TTSPerfMode {
     Standard,
     FlashAttention,
+    MixedAttention,
 };
 
 struct Qwen3TTSGenerationOptions {
@@ -68,11 +70,7 @@ struct Qwen3TTSResult {
     std::vector<int32_t> codec_codes;
 };
 
-struct Qwen3SpeechCodes {
-    std::vector<int32_t> codes;
-    int64_t frames = 0;
-    int64_t code_groups = 0;
-};
+using Qwen3SpeechCodes = codecs::Qwen3SpeechCodes;
 
 struct Qwen3SpeakerEmbedding {
     std::vector<float> values;

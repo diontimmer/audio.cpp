@@ -3,6 +3,7 @@
 #include "engine/framework/core/module.h"
 
 #include <cstdint>
+#include <optional>
 
 namespace engine::modules {
 
@@ -15,6 +16,10 @@ struct RoPEConfig {
     float attn_factor = 1.0f;
     float beta_fast = 0.0f;
     float beta_slow = 0.0f;
+    std::optional<ggml_type> intermediate_round_type = std::nullopt;
+    // Original (pre-scaling) context length for YaRN correction ranges,
+    // forwarded as ggml_rope_ext n_ctx_orig. 0 preserves the legacy call.
+    int32_t orig_context = 0;
 };
 
 class RoPEModule {
@@ -22,6 +27,13 @@ public:
     explicit RoPEModule(RoPEConfig config);
 
     core::TensorValue build(
+        core::ModuleBuildContext & ctx,
+        const core::TensorValue & input,
+        const core::TensorValue & positions,
+        const core::TensorValue * frequency_factors = nullptr) const;
+
+    // Independent positions [batch, time] for input [batch, time, heads, dimension].
+    core::TensorValue build_batched(
         core::ModuleBuildContext & ctx,
         const core::TensorValue & input,
         const core::TensorValue & positions,

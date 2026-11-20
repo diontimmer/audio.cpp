@@ -11,8 +11,11 @@ struct ConvNeXt1dWeights {
     LinearWeights expansion;
     LinearWeights projection;
     core::TensorValue gamma;
+    // ConvNeXtV2 global response normalization, before the output projection.
+    core::TensorValue response_gamma{}, response_beta{};
 };
+// Optional BF16 autocast preserves F32 normalization and residual arithmetic.
 core::TensorValue build_convnext1d(
     core::ModuleBuildContext & ctx, const core::TensorValue & input,
-    const ConvNeXt1dWeights & weights);
+    const ConvNeXt1dWeights & weights, bool bf16_autocast = false);
 }

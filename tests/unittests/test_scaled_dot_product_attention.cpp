@@ -30,6 +30,7 @@ struct SdpaCase {
     int64_t key_steps;
     int64_t head_dim;
     bool causal_mask;
+    int64_t value_dim = 0;
 };
 
 struct RunResult {
@@ -44,6 +45,7 @@ const char * backend_name(engine::core::BackendType backend_type) {
         case engine::core::BackendType::Hip: return "hip";
         case engine::core::BackendType::Vulkan: return "vulkan";
         case engine::core::BackendType::Metal: return "metal";
+        case engine::core::BackendType::WebGPU: return "webgpu";
         case engine::core::BackendType::BestAvailable: return "best";
     }
     return "unknown";
@@ -170,7 +172,7 @@ public:
                 test_case.batch,
                 test_case.heads,
                 test_case.key_steps,
-                test_case.head_dim,
+                test_case.value_dim > 0 ? test_case.value_dim : test_case.head_dim,
             }));
         if (use_attention_mask_) {
             mask_ = engine::core::make_tensor(
@@ -475,7 +477,8 @@ void run_cpu_case(const SdpaCase & test_case) {
             1.17F + static_cast<float>(round) * 0.37F,
             0.16F);
         const auto v = make_patterned_f32(
-            static_cast<size_t>(test_case.batch * test_case.heads * test_case.key_steps * test_case.head_dim),
+            static_cast<size_t>(test_case.batch * test_case.heads * test_case.key_steps *
+                (test_case.value_dim > 0 ? test_case.value_dim : test_case.head_dim)),
             2.03F + static_cast<float>(round) * 0.19F,
             0.12F);
         const std::vector<float> no_mask;
@@ -505,6 +508,7 @@ void run_cpu_case(const SdpaCase & test_case) {
 }  // namespace
 
 int main() try {
+    run_cpu_case({"unequal_value_width", 2, 3, 19, 23, 16, false, 24});
     const bool has_cuda = backend_available(engine::core::BackendType::Cuda);
     const auto backend_type = has_cuda ? engine::core::BackendType::Cuda : engine::core::BackendType::Cpu;
     run_manual_repeat_parity_cases(backend_type);

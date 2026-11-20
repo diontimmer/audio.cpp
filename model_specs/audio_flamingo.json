@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "family": "audio_flamingo",
-  "display_name": "Audio Flamingo 3 / Next",
-  "description": "Audio Flamingo 3 and Audio Flamingo Next models for transcription, captioning, and questions about speech, music, and environmental sounds.",
+  "display_name": "Audio Flamingo 3 / Next / Music Flamingo",
+  "description": "Audio Flamingo 3, Audio Flamingo Next, and Music Flamingo for transcription, captioning, and audio questions, with optional PEFT LoRA and SpotSound temporal grounding.",
   "category": "asr",
   "status": "supported",
   "tasks": [
@@ -30,12 +30,22 @@
         "description": "Question or instruction about the input audio."
       },
       {
+        "name": "template_name",
+        "type": "enum",
+        "values": [
+          "default",
+          "temporal_grounding"
+        ],
+        "default": "default",
+        "required": false,
+        "description": "Prompt layout. temporal_grounding uses SpotSound timestamp-interleaved audio tokens and wraps instruct or text as an event query; requires Audio Flamingo 3 and at least one second of audio. Use with its matching adapter."
+      },
+      {
         "name": "max_tokens",
         "type": "int",
-        "default": 2048,
         "min": 1,
         "required": false,
-        "description": "Maximum generated response tokens."
+        "description": "Maximum generated response tokens. Defaults to checkpoint generation configuration (2048 fallback); prompt plus output budget must fit model positions."
       },
       {
         "name": "do_sample",
@@ -48,42 +58,36 @@
         "name": "temperature",
         "type": "float",
         "default": 1,
-        "min": 0.01,
         "required": false,
-        "description": "Sampling temperature."
+        "description": "Sampling temperature. Used only when do_sample=true; must be positive when sampling."
       },
       {
         "name": "top_k",
         "type": "int",
         "default": 50,
-        "min": 0,
         "required": false,
-        "description": "Sampling candidate count; zero disables top-k filtering."
+        "description": "Sampling candidate count; zero disables top-k filtering. Used only when sampling; nonpositive values disable top-k filtering."
       },
       {
         "name": "top_p",
         "type": "float",
         "default": 1,
-        "min": 0.01,
-        "max": 1,
         "required": false,
-        "description": "Nucleus sampling probability."
+        "description": "Nucleus sampling probability. Used only when sampling; zero is accepted and values >=1 disable nucleus filtering."
       },
       {
         "name": "repetition_penalty",
         "type": "float",
         "default": 1,
-        "min": 0.01,
         "required": false,
-        "description": "Token repetition penalty."
+        "description": "Token repetition penalty. Must be positive."
       },
       {
         "name": "seed",
         "type": "int",
         "default": 42,
-        "min": 0,
         "required": false,
-        "description": "Sampling seed."
+        "description": "Sampling seed. Parsed as a signed integer and converted to uint32."
       }
     ],
     "session": [
@@ -94,6 +98,19 @@
         "default": "native",
         "required": false,
         "description": "Weight storage type; native preserves the packaged tensor types."
+      },
+      {
+        "name": "lora",
+        "type": "path",
+        "required": false,
+        "description": "Matching PEFT LoRA adapter directory or checkpoint file; merged at session creation. Keep adapter_config.json beside the weights."
+      },
+      {
+        "name": "lora_scale",
+        "type": "float",
+        "default": 1,
+        "required": false,
+        "description": "Multiplier for the adapter's alpha/r scaling."
       }
     ],
     "load": []
@@ -166,6 +183,16 @@
       "target_directory": "Audio-Flamingo-GGUF",
       "files": [
         "audio-flamingo-3-bf16.gguf"
+      ]
+    },
+    {
+      "id": "music_flamingo_2601_q8_0",
+      "display_name": "Music Flamingo 2601 GGUF Q8_0",
+      "format": "gguf",
+      "precision": "q8_0",
+      "target_directory": "Audio-Flamingo-GGUF",
+      "files": [
+        "music-flamingo-2601-q8_0.gguf"
       ]
     }
   ],

@@ -59,7 +59,7 @@
       {
         "name": "max_tokens",
         "type": "int",
-        "description": "Maximum generated audio tokens.",
+        "description": "Maximum generated audio tokens. Zero resolves to model max_length; requires min_tokens <= resolved max_tokens <= model limit.",
         "required": false,
         "min": 0,
         "default": 4096
@@ -67,35 +67,35 @@
       {
         "name": "num_inference_steps",
         "type": "int",
-        "description": "Flow sampling steps.",
+        "description": "Flow sampling steps. Must be positive.",
         "required": false,
         "default": 10
       },
       {
         "name": "guidance_scale",
         "type": "float",
-        "description": "Classifier-free guidance scale.",
+        "description": "Classifier-free guidance scale. Must be nonnegative.",
         "required": false,
         "default": 2
       },
       {
         "name": "retry_badcase",
         "type": "bool",
-        "description": "Retry detected bad generations.",
+        "description": "Retry detected bad generations. Offline only; streaming requires false.",
         "required": false,
         "default": true
       },
       {
         "name": "retry_badcase_max_times",
         "type": "int",
-        "description": "Maximum bad-case retries.",
+        "description": "Total attempts including the initial attempt, not extra retries; must be positive.",
         "required": false,
         "default": 3
       },
       {
         "name": "retry_badcase_ratio_threshold",
         "type": "float",
-        "description": "Bad-case audio/text length ratio threshold.",
+        "description": "Bad-case audio/text length ratio threshold. Must be positive.",
         "required": false,
         "default": 6
       },
@@ -115,6 +115,25 @@
         "required": false
       },
       {
+        "name": "stream_chunk_policy",
+        "type": "enum",
+        "description": "Streaming decoder cadence: grow emits one patch first, then doubles toward stream_frames_per_event; fixed uses the configured size. Ignored offline.",
+        "required": false,
+        "values": [
+          "grow",
+          "fixed"
+        ],
+        "default": "grow"
+      },
+      {
+        "name": "stream_frames_per_event",
+        "type": "int",
+        "description": "Maximum generated latent patches per streaming decoder event. Set to 1 for one-patch emission. Ignored offline.",
+        "required": false,
+        "min": 1,
+        "default": 4
+      },
+      {
         "name": "stream_left_context",
         "type": "int",
         "description": "Previous patches decoded as streaming left context.",
@@ -122,6 +141,13 @@
         "min": 0,
         "max": 8,
         "default": 3
+      },
+      {
+        "name": "ultimate_clone",
+        "type": "bool",
+        "description": "Use the voice reference itself as the continuation prompt. Requires reference audio and reference_text or prompt_text; cannot be combined with explicit prompt audio.",
+        "required": false,
+        "default": false
       },
       {
         "name": "prompt_text",
@@ -132,7 +158,7 @@
       {
         "name": "chunk_strategy",
         "type": "enum",
-        "description": "Long-form continuation or independent generation per chunk.",
+        "description": "Long-form continuation or independent generation per chunk. Offline only.",
         "required": false,
         "values": [
           "continuation",
@@ -143,14 +169,14 @@
       {
         "name": "text_chunk_size",
         "type": "int",
-        "description": "Framework long-form text chunk size.",
+        "description": "Framework long-form text chunk size. Offline only.",
         "required": false,
         "default": 2048
       },
       {
         "name": "text_chunk_mode",
         "type": "enum",
-        "description": "Framework text chunking mode.",
+        "description": "Framework text chunking mode. Offline only.",
         "required": false,
         "values": [
           "default",
@@ -163,16 +189,48 @@
     ],
     "session": [
       {
+        "name": "audiovae_tile_frames",
+        "type": "int",
+        "description": "Opt-in causal AudioVAE tiling. Maximum new latent frames per tile; zero preserves full decoding.",
+        "required": false,
+        "default": 0,
+        "min": 0
+      },
+      {
+        "name": "perf_mode",
+        "type": "enum",
+        "description": "Opt-in packed attention and MLP projections. May change numerical results; off preserves standard execution.",
+        "required": false,
+        "values": [
+          "off",
+          "cuda_perf"
+        ],
+        "default": "off"
+      },
+      {
+        "name": "lora",
+        "type": "path",
+        "description": "Native LoRA directory or checkpoint file with adjacent lora_config.json; merged into generator weights at session creation.",
+        "required": false
+      },
+      {
+        "name": "lora_scale",
+        "type": "float",
+        "description": "Multiplier for the adapter's configured alpha/r scaling; default 1.",
+        "required": false,
+        "default": 1.0
+      },
+      {
         "name": "weight_type",
         "type": "enum",
-        "description": "Weight storage type; component-specific settings inherit weight_type.",
+        "description": "Language-model weight storage; does not override AudioVAE storage.",
         "required": false,
         "preset": "weight_type_full"
       },
       {
         "name": "audiovae_weight_type",
         "type": "enum",
-        "description": "Weight storage type; component-specific settings inherit weight_type.",
+        "description": "AudioVAE weight storage; defaults independently to native, not the shared weight_type.",
         "required": false,
         "preset": "weight_type_full"
       },
@@ -197,47 +255,47 @@
         "description": "Context or graph arena size in MiB.",
         "required": false,
         "min": 1,
-        "default": 3072
+        "default": 8
       },
       {
-        "name": "text_embedding_graph_context_mb",
+        "name": "text_embedding_graph_arena_mb",
         "type": "int",
-        "description": "Context or graph arena size in MiB.",
+        "description": "Text embedding host graph-metadata arena size in MiB, not device workspace.",
         "required": false,
         "min": 1,
-        "default": 64
+        "default": 32
       },
       {
-        "name": "lm_step_graph_context_mb",
+        "name": "lm_step_graph_arena_mb",
         "type": "int",
-        "description": "Context or graph arena size in MiB.",
+        "description": "LM step host graph-metadata arena size in MiB, not device workspace.",
         "required": false,
         "min": 1,
-        "default": 1024
+        "default": 32
       },
       {
-        "name": "projection_graph_context_mb",
+        "name": "projection_graph_arena_mb",
         "type": "int",
-        "description": "Context or graph arena size in MiB.",
+        "description": "Projection host graph-metadata arena size in MiB, not device workspace.",
         "required": false,
         "min": 1,
-        "default": 256
+        "default": 32
       },
       {
-        "name": "local_encoder_graph_context_mb",
+        "name": "local_encoder_graph_arena_mb",
         "type": "int",
-        "description": "Context or graph arena size in MiB.",
+        "description": "Local encoder host graph-metadata arena size in MiB, not device workspace.",
         "required": false,
         "min": 1,
-        "default": 512
+        "default": 32
       },
       {
-        "name": "dit_graph_context_mb",
+        "name": "dit_graph_arena_mb",
         "type": "int",
-        "description": "Context or graph arena size in MiB.",
+        "description": "DiT estimator host graph-metadata arena size in MiB, not device workspace.",
         "required": false,
         "min": 1,
-        "default": 1024
+        "default": 32
       },
       {
         "name": "audiovae_weight_context_mb",
@@ -245,30 +303,37 @@
         "description": "Context or graph arena size in MiB.",
         "required": false,
         "min": 1,
-        "default": 768
+        "default": 8
       },
       {
-        "name": "audiovae_graph_context_mb",
+        "name": "audiovae_graph_arena_mb",
         "type": "int",
-        "description": "Context or graph arena size in MiB.",
+        "description": "AudioVAE decoder host graph-metadata arena size in MiB, not device workspace.",
         "required": false,
         "min": 1,
-        "default": 1024
+        "default": 32
       },
       {
-        "name": "audiovae_encoder_graph_context_mb",
+        "name": "audiovae_encoder_graph_arena_mb",
         "type": "int",
-        "description": "Context or graph arena size in MiB.",
+        "description": "AudioVAE encoder host graph-metadata arena size in MiB, not device workspace.",
         "required": false,
         "min": 1,
-        "default": 1024
+        "default": 32
       },
       {
         "name": "audiovae_latent_capacity",
         "type": "int",
-        "description": "Optional reserved latent frame capacity; omitted selects automatically.",
+        "description": "Optional decoder graph reservation in latent frames, reused by shorter requests and doubled when exceeded; omitted builds the graph at each request's own frame count.",
         "required": false,
         "min": 1
+      },
+      {
+        "name": "exec_plan",
+        "type": "string",
+        "description": "JSON component execution plans. audiovae: impl=default/ggml; backend must match the session; no artifacts. params.threads is a nonnegative int: positive values require a CPU session and enable a dedicated AudioVAE backend with streaming decode overlap; also controls offline decoding and prompt encoding threads. Omitted/0 shares the session backend.",
+        "required": false,
+        "default": "{}"
       },
       {
         "name": "audiovae_encoder_sample_capacity",
@@ -306,7 +371,8 @@
     ],
     "docs": [
       "docs/tts.md",
-      "docs/gguf.md"
+      "docs/gguf.md",
+      "docs/models/vocalrender.md"
     ]
   },
   "package_defaults": {
@@ -349,6 +415,17 @@
       "target_directory": "VoxCPM2-GGUF",
       "files": [
         "VoxCPM2-GGUF/voxcpm2-orig.gguf"
+      ],
+      "strip_prefix": "VoxCPM2-GGUF"
+    },
+    {
+      "id": "voxcpm2_vocalrender_pro",
+      "display_name": "VocalRender-Pro (VoxCPM2) Original-Dtype GGUF",
+      "format": "gguf",
+      "precision": "orig",
+      "target_directory": "VoxCPM2-GGUF",
+      "files": [
+        "VoxCPM2-GGUF/finetune/vocalrender-pro-orig.gguf"
       ],
       "strip_prefix": "VoxCPM2-GGUF"
     },

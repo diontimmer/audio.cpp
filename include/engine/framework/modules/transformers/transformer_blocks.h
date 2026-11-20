@@ -22,6 +22,9 @@ struct TransformerEncoderBlockConfig {
     ggml_prec projection_precision = GGML_PREC_DEFAULT;
     ggml_prec attention_precision = GGML_PREC_DEFAULT;
     AttentionPrefixCacheLayout prefix_cache_layout = AttentionPrefixCacheLayout::SequenceHeads;
+    bool use_packed_qkv = false;
+    bool use_flash_attention = false;
+    GeluApproximation gelu_approximation = GeluApproximation::ExactErf;
 };
 
 struct TransformerEncoderBlockWeights {

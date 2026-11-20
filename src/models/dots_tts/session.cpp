@@ -481,7 +481,11 @@ runtime::RunMode DotsSession::run_mode() const {
 }
 
 void DotsSession::prepare(const runtime::SessionPreparationRequest & request) {
-    runtime::validate_spec_backed_request_options(request.options, *contract_, "DotTTS");
+    auto validation_options = request.options;
+    validation_options.erase("instruct");
+    validation_options.erase("instruction");
+    (void)runtime::find_option(request.options, {"instruction", "instruct"});
+    runtime::validate_spec_backed_request_options(validation_options, *contract_, "DotTTS");
     prepared_defaults_ = make_dots_prepare_defaults(*assets_, request);
     mark_prepared();
 }
@@ -839,6 +843,7 @@ std::vector<DotsLatentMatrix> DotsSession::generate_latent_patches(
     debug::timing_log_scalar("dots_tts.decode.llm_prefill_ms", llm_prefill_ms);
     debug::timing_log_scalar("dots_tts.decode.llm_decode_ms", llm_decode_ms);
     debug::timing_log_scalar("dots_tts.decode.eos_ms", eos_ms);
+    flow_.release_decode_cache();
     return payload;
 }
 
@@ -1143,6 +1148,7 @@ std::vector<DotsLatentMatrix> DotsSession::generate_edit_latent_patches(
     debug::timing_log_scalar("dots_tts.edit.decode.llm_prefill_ms", llm_prefill_ms);
     debug::timing_log_scalar("dots_tts.edit.decode.llm_decode_ms", llm_decode_ms);
     debug::timing_log_scalar("dots_tts.edit.decode.eos_ms", eos_ms);
+    flow_.release_decode_cache();
     return payload;
 }
 
@@ -1376,7 +1382,10 @@ runtime::TaskResult DotsSession::run(const runtime::TaskRequest & request) {
     if (task_.mode != runtime::RunMode::Offline) {
         throw std::runtime_error("DotTTS run requires an offline session");
     }
-    runtime::validate_spec_backed_request_options(request.options, *contract_, "DotTTS");
+    auto validation_options = request.options;
+    validation_options.erase("instruct");
+    validation_options.erase("instruction");
+    runtime::validate_spec_backed_request_options(validation_options, *contract_, "DotTTS");
     const auto start = Clock::now();
     auto parsed = make_dots_request(*assets_, request, prepared_defaults_);
     runtime::TaskResult result;
@@ -1397,7 +1406,10 @@ void DotsSession::start_stream(const runtime::TaskRequest & request) {
     if (task_.mode != runtime::RunMode::Streaming) {
         throw std::runtime_error("DotTTS start_stream requires a streaming session");
     }
-    runtime::validate_spec_backed_request_options(request.options, *contract_, "DotTTS");
+    auto validation_options = request.options;
+    validation_options.erase("instruct");
+    validation_options.erase("instruction");
+    runtime::validate_spec_backed_request_options(validation_options, *contract_, "DotTTS");
     reset();
     const auto start = Clock::now();
     auto parsed = make_dots_request(*assets_, request, prepared_defaults_);
@@ -1479,6 +1491,7 @@ runtime::TaskResult DotsSession::finish_stream() {
 
 void DotsSession::reset() {
     streaming_result_.reset();
+    flow_.release_decode_cache();
 }
 
 runtime::StreamEvent DotsSession::process_audio_chunk(const runtime::AudioChunk & chunk) {

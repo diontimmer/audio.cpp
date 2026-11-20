@@ -1,6 +1,7 @@
 #include "engine/models/breeze_tts/session.h"
 
 #include "engine/framework/core/attention_fallback.h"
+#include "engine/framework/core/backend.h"
 #include "engine/framework/debug/profiler.h"
 #include "engine/framework/runtime/options.h"
 #include "engine/framework/runtime/spec_backed_model.h"
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -75,6 +77,40 @@ Bf16ActivationMode bf16_activation_mode_from_options(const runtime::SessionOptio
     throw std::runtime_error("BreezeTTS bf16_activations must be auto, on or off (got '" + *value + "')");
 }
 
+struct PerfPreset {
+    std::string_view name;
+    BreezePerfOptions options;
+};
+
+constexpr PerfPreset kPerfPresets[] = {
+    {"off", {true, true, true, false}},
+    {"cuda_perf", {true, true, true, true}},
+};
+
+// perf_mode picks the defaults; explicit options override the preset.
+BreezePerfOptions perf_options_from_options(const runtime::SessionOptions & options) {
+    const auto perf_mode = runtime::find_option(options.options, {"breeze_tts.perf_mode"}).value_or("off");
+    const auto * preset = std::find_if(std::begin(kPerfPresets), std::end(kPerfPresets),
+        [&](const PerfPreset & entry) { return entry.name == perf_mode; });
+    if (preset == std::end(kPerfPresets)) {
+        throw std::runtime_error("BreezeTTS perf_mode must be off or cuda_perf (got '" + perf_mode + "')");
+    }
+    auto perf = preset->options;
+    const std::pair<const char *, bool BreezePerfOptions::*> flags[] = {
+        {"breeze_tts.fused_depth", &BreezePerfOptions::fused_depth},
+        {"breeze_tts.direct_prefill", &BreezePerfOptions::direct_prefill},
+        {"breeze_tts.skip_cache_round", &BreezePerfOptions::skip_cache_round},
+        {"breeze_tts.batched_cfg", &BreezePerfOptions::batched_cfg},
+    };
+    for (const auto & [key, member] : flags) {
+        if (const auto value = runtime::find_option(options.options, {key})) {
+            perf.*member = runtime::parse_bool_option(*value, key);
+        }
+    }
+    engine::debug::trace_log_scalar("breeze_tts.perf_mode", std::string_view(preset->name));
+    return perf;
+}
+
 void trace_attention_preference(core::AttentionPreference preference) {
     const char * name = "auto";
     if (preference == core::AttentionPreference::Flash) {
@@ -92,8 +128,11 @@ void validate_session_options(
     // Older standalone GGUF packages embed a v1 contract that predates this
     // backend-compatibility option; keep them usable while still validating
     // the option value in attention_preference_from_options().
-    // bf16_activations is handled the same way.
-    for (const char * key : {"breeze_tts.attention", "bf16_activations", "breeze_tts.bf16_activations"}) {
+    // bf16_activations and the performance controls are handled the same way.
+    for (const char * key : {"breeze_tts.attention", "bf16_activations", "breeze_tts.bf16_activations",
+                             "breeze_tts.perf_mode", "breeze_tts.fused_depth",
+                             "breeze_tts.direct_prefill", "breeze_tts.skip_cache_round",
+                             "breeze_tts.round_bf16_fusion", "breeze_tts.batched_cfg"}) {
         if (contract.session_option_keys.find(key) == contract.session_option_keys.end()) {
             validation_options.options.erase(key);
         }
@@ -105,7 +144,10 @@ void validate_request_options(
     const std::unordered_map<std::string, std::string> & options,
     const engine::model_spec::ModelContract & contract) {
     auto validation_options = options;
-    for (const char * key : {"stream_frames_per_event", "stream_lookahead_margin"}) {
+    validation_options.erase("instruct");
+    validation_options.erase("instruction");
+    (void)runtime::find_option(options, {"instruct", "instruction"});
+    for (const char * key : {"stream_frames_per_event", "stream_lookahead_margin", "stream_chunk_policy"}) {
         if (contract.request_option_keys.find(key) == contract.request_option_keys.end()) {
             validation_options.erase(key);
         }
@@ -116,7 +158,7 @@ void validate_request_options(
 std::size_t reference_cache_slots_from_options(const runtime::SessionOptions & options) {
     const int64_t slots = runtime::parse_i64_option(
         options.options,
-        {"reference_cache_slots"})
+        {"breeze_tts.reference_cache_slots", "reference_cache_slots"})
         .value_or(kDefaultReferenceCacheSlots);
     if (slots < 0) {
         throw std::runtime_error("breeze_tts.reference_cache_slots must be non-negative");
@@ -125,6 +167,15 @@ std::size_t reference_cache_slots_from_options(const runtime::SessionOptions & o
         throw std::runtime_error("breeze_tts.reference_cache_slots is too large");
     }
     return static_cast<std::size_t>(slots);
+}
+
+// Opt-in CUDA fusion of the bf16-reference rounding into its producing
+// kernels; bit-identical to the unfused graph, ignored on other backends.
+bool round_bf16_fusion_from_options(const runtime::SessionOptions & options) {
+    const auto it = options.options.find("breeze_tts.round_bf16_fusion");
+    const bool enabled = it != options.options.end() && runtime::parse_bool_option(it->second, it->first);
+    engine::debug::trace_log_scalar("breeze_tts.round_bf16_fusion", enabled);
+    return enabled;
 }
 
 uint64_t fnv1a_mix(uint64_t hash, const void * data, size_t size) {
@@ -177,22 +228,26 @@ BreezeTTSSession::BreezeTTSSession(
         throw std::runtime_error("BreezeTTS supports offline and streaming sessions");
     }
     using T = engine::assets::TensorStorageType;
+    const auto storage_option = runtime::find_option_match(
+        options.options, {"breeze_tts.weight_type", "weight_type"});
     const auto storage_type = runtime::parse_tensor_storage_option(
         options.options,
-        "weight_type",
+        storage_option ? storage_option->key : "breeze_tts.weight_type",
         T::Native,
         {T::Native, T::F32, T::F16, T::BF16, T::Q8_0, T::Q4_0, T::Q4_K});
     const auto graph_arena_bytes = runtime::parse_size_mb_option(
         options.options,
-        {"graph_arena_mb"},
+        {"breeze_tts.graph_arena_mb", "graph_arena_mb"},
         32ull * 1024ull * 1024ull);
     const auto weight_context_bytes = runtime::parse_size_mb_option(
         options.options,
-        {"weight_context_mb"},
+        {"breeze_tts.weight_context_mb", "weight_context_mb"},
         4ull * 1024ull * 1024ull);
     const auto attention_preference = attention_preference_from_options(options);
     trace_attention_preference(attention_preference);
     const auto bf16_activations = bf16_activation_mode_from_options(options);
+    const auto perf = perf_options_from_options(options);
+    core::set_backend_round_bf16_fusion(execution_context().backend(), round_bf16_fusion_from_options(options));
     generator_ = std::make_unique<BreezeGeneratorRuntime>(
         assets_,
         execution_context(),
@@ -200,7 +255,8 @@ BreezeTTSSession::BreezeTTSSession(
         weight_context_bytes,
         storage_type,
         attention_preference,
-        bf16_activations);
+        bf16_activations,
+        perf);
 }
 
 BreezeTTSSession::~BreezeTTSSession() = default;
@@ -283,8 +339,18 @@ runtime::TaskResult BreezeTTSSession::run(const runtime::TaskRequest & request) 
         request.voice->speaker->audio.has_value()) {
         reference_codes = resolve_reference_codes(*request.voice->speaker->audio);
     }
+    const bool anchor_voice = chunks.size() > 1 && !reference_codes.has_value();
     for (size_t index = 0; index < chunks.size(); ++index) {
-        runtime::append_audio_buffer(merged, generator_->generate(build_generation_request(chunks[index], reference_codes, index)));
+        auto generation = build_generation_request(chunks[index], reference_codes, index);
+        if (anchor_voice && index > 0) {
+            generation.reference_text = chunks.front().text_input->text;
+        }
+        BreezeSpeechCodes first_codes;
+        runtime::append_audio_buffer(merged, generator_->generate(
+            generation, anchor_voice && index == 0 ? &first_codes : nullptr));
+        if (anchor_voice && index == 0) {
+            reference_codes = std::move(first_codes);
+        }
     }
     runtime::TaskResult result;
     result.audio_output = std::move(merged);
@@ -292,142 +358,66 @@ runtime::TaskResult BreezeTTSSession::run(const runtime::TaskRequest & request) 
     return result;
 }
 
-runtime::StreamingPolicy BreezeTTSSession::streaming_policy() const {
-    runtime::StreamingPolicy policy;
-    policy.input = runtime::StreamingInputKind::None;
-    policy.output = runtime::StreamingOutputKind::PullEvents;
-    return policy;
-}
-
-void BreezeTTSSession::start_stream(const runtime::TaskRequest & request) {
+runtime::TaskResult BreezeTTSSession::generate_stream(const runtime::TaskRequest & request) {
     validate_request_options(request.options, *contract_);
     require_prepared("BreezeTTS streaming");
-    if (task_.mode != runtime::RunMode::Streaming) {
-        throw std::runtime_error("BreezeTTS start_stream requires a streaming session");
-    }
     if (!request.text_input.has_value() || request.text_input->text.empty()) {
         throw std::runtime_error("BreezeTTS streaming requires text input");
     }
-    reset();
-    stream_chunk_requests_ = split_request(request);
+    const auto started_at = std::chrono::steady_clock::now();
+    const auto chunks = split_request(request);
     const int64_t text_chunk_size =
         engine::text::parse_text_chunk_size_override(request.options).value_or(kDefaultTextChunkSize);
     const auto text_chunk_mode =
         engine::text::parse_text_chunk_mode_override(request.options).value_or(engine::text::TextChunkMode::Default);
     engine::debug::trace_log_scalar("breeze_tts.streaming.text_chunk_mode", engine::text::text_chunk_mode_name(text_chunk_mode));
     engine::debug::trace_log_scalar("breeze_tts.streaming.text_chunk_size", text_chunk_size);
-    engine::debug::trace_log_scalar("breeze_tts.streaming.text.chunk_count", static_cast<int64_t>(stream_chunk_requests_.size()));
+    engine::debug::trace_log_scalar("breeze_tts.streaming.text.chunk_count", static_cast<int64_t>(chunks.size()));
+    std::optional<BreezeSpeechCodes> reference_codes;
     if (request.voice.has_value() &&
         request.voice->speaker.has_value() &&
         request.voice->speaker->audio.has_value()) {
-        stream_reference_codes_ = resolve_reference_codes(*request.voice->speaker->audio);
+        reference_codes = resolve_reference_codes(*request.voice->speaker->audio);
     }
     const auto frames_per_event = runtime::parse_i64_option(request.options, {"stream_frames_per_event"})
-        .value_or(static_cast<int64_t>(stream_frames_per_event_));
+        .value_or(16);
     if (frames_per_event <= 0) {
         throw std::runtime_error("BreezeTTS stream_frames_per_event must be positive");
     }
-    stream_frames_per_event_ = static_cast<size_t>(frames_per_event);
-    stream_lookahead_margin_ = runtime::parse_i64_option(request.options, {"stream_lookahead_margin"})
-        .value_or(stream_lookahead_margin_);
-    if (stream_lookahead_margin_ < 0) {
+    const auto lookahead = runtime::parse_i64_option(request.options, {"stream_lookahead_margin"}).value_or(0);
+    if (lookahead < 0) {
         throw std::runtime_error("BreezeTTS stream_lookahead_margin must be non-negative");
     }
-    stream_merged_audio_ = runtime::AudioBuffer{24000, 1, {}};
-    stream_started_at_ = std::chrono::steady_clock::now();
+    runtime::StreamingAudioConfig config;
+    config.frames_per_chunk = static_cast<size_t>(frames_per_event);
+    config.right_context_frames = static_cast<size_t>(lookahead);
+    config.policy = runtime::parse_streaming_audio_chunk_policy(
+        runtime::find_option(request.options, {"stream_chunk_policy"}).value_or("grow"));
     engine::debug::trace_log_scalar(
-        "breeze_tts.streaming.frames_per_event", static_cast<int64_t>(stream_frames_per_event_));
-    engine::debug::trace_log_scalar("breeze_tts.streaming.lookahead_margin", stream_lookahead_margin_);
-    stream_started_ = true;
-}
-
-std::optional<runtime::StreamEvent> BreezeTTSSession::next_stream_event() {
-    if (!stream_started_) {
-        throw std::runtime_error("BreezeTTS streaming has not been started");
-    }
-    if (stream_chunk_index_ >= stream_chunk_requests_.size()) {
-        return std::nullopt;
-    }
-    while (true) {
-        if (stream_chunk_index_ >= stream_chunk_requests_.size()) {
-            return std::nullopt;
+        "breeze_tts.streaming.frames_per_event", frames_per_event);
+    engine::debug::trace_log_scalar("breeze_tts.streaming.lookahead_margin", lookahead);
+    runtime::AudioBuffer merged{24000, 1, {}};
+    const bool anchor_voice = chunks.size() > 1 && !reference_codes.has_value();
+    for (size_t index = 0; index < chunks.size(); ++index) {
+        auto generation = build_generation_request(chunks[index], reference_codes, index);
+        if (anchor_voice && index > 0) {
+            generation.reference_text = chunks.front().text_input->text;
         }
-        const size_t chunk_index = stream_chunk_index_;
-        if (!stream_chunk_active_) {
-            generator_->begin_stream(build_generation_request(
-                stream_chunk_requests_[chunk_index],
-                stream_reference_codes_,
-                chunk_index));
-            stream_chunk_active_ = true;
+        BreezeSpeechCodes first_codes;
+        runtime::append_audio_buffer(merged, generator_->generate_stream(
+            generation, config, stream_event_sink(), anchor_voice && index == 0 ? &first_codes : nullptr));
+        if (anchor_voice && index == 0) {
+            reference_codes = std::move(first_codes);
         }
-
-        BreezeStreamEvent event_audio;
-        try {
-            event_audio = generator_->next_stream_audio(stream_frames_per_event_, stream_lookahead_margin_);
-        } catch (...) {
-            generator_->end_stream();
-            stream_chunk_active_ = false;
-            throw;
-        }
-        if (event_audio.done) {
-            generator_->end_stream();
-            stream_chunk_active_ = false;
-            ++stream_chunk_index_;
-        }
-        if (event_audio.audio.samples.empty()) {
-            continue;
-        }
-        runtime::append_audio_buffer(stream_merged_audio_, event_audio.audio);
-        runtime::StreamEvent event;
-        event.named_audio_outputs.push_back({
-            "chunk_" + std::to_string(chunk_index) + "_part_" + std::to_string(stream_event_seq_++),
-            std::move(event_audio.audio),
-            {},
-        });
-        engine::debug::trace_log_scalar("breeze_tts.streaming.event_index", static_cast<int64_t>(stream_event_seq_));
-        return event;
-    }
-}
-
-void BreezeTTSSession::set_stream_event_sink(runtime::StreamEventCallback sink) {
-    (void)sink;
-}
-
-runtime::TaskResult BreezeTTSSession::finish_stream() {
-    if (!stream_started_) {
-        throw std::runtime_error("BreezeTTS streaming has not been started");
-    }
-    while (next_stream_event().has_value()) {
     }
     runtime::TaskResult result;
-    result.audio_output = std::move(stream_merged_audio_);
-    engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(stream_started_at_));
-    reset();
+    result.audio_output = std::move(merged);
+    engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(started_at));
     return result;
 }
 
-void BreezeTTSSession::reset() {
-    if (stream_chunk_active_) {
-        generator_->end_stream();
-        stream_chunk_active_ = false;
-    }
-    stream_chunk_requests_.clear();
-    stream_reference_codes_.reset();
-    stream_merged_audio_ = runtime::AudioBuffer{};
-    stream_chunk_index_ = 0;
-    stream_frames_per_event_ = 16;
-    stream_lookahead_margin_ = 12;
-    stream_event_seq_ = 0;
-    stream_started_ = false;
-}
-
-runtime::StreamEvent BreezeTTSSession::process_audio_chunk(const runtime::AudioChunk & chunk) {
-    (void)chunk;
-    throw std::runtime_error("BreezeTTS streaming does not consume audio chunks");
-}
-
-runtime::TaskResult BreezeTTSSession::finalize() {
-    return finish_stream();
+void BreezeTTSSession::reset_stream_state() {
+    generator_->end_stream();
 }
 
 BreezeGenerationRequest BreezeTTSSession::build_generation_request(
@@ -436,7 +426,7 @@ BreezeGenerationRequest BreezeTTSSession::build_generation_request(
     size_t chunk_index) const {
     BreezeGenerationRequest generation;
     generation.text = request.text_input->text;
-    generation.instruction = runtime::find_option(request.options, {"instruction"}).value_or("");
+    generation.instruction = runtime::find_option(request.options, {"instruct", "instruction"}).value_or("");
     generation.reference_text = runtime::find_option(request.options, {"reference_text"}).value_or("");
     generation.guidance_scale = runtime::parse_finite_float_option(request.options, {"guidance_scale"}).value_or(generation.guidance_scale);
     if (generation.guidance_scale < 0.0F) {

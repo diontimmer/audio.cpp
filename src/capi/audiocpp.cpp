@@ -1,10 +1,11 @@
 /*
  * C ABI facade over engine::runtime.
  *
- * This file adds no behaviour. It owns three things and nothing else:
+ * This file adds no model behaviour. It handles:
  *   1. translating C types to and from the framework's own types,
  *   2. stopping every exception at the boundary,
  *   3. keeping parent handles alive so callers can free in any order.
+ *   4. locating bundled backend plugins beside the shared library.
  *
  * It deliberately depends only on the framework (the same headers
  * audiocpp_cli uses) and never on app/, so the CLI and the C API stay
@@ -13,13 +14,18 @@
 
 #include "audiocpp.h"
 
+#include <ggml.h>
+
 #include "engine/framework/runtime/task_vocabulary.h"
 
+#include "engine/framework/debug/trace.h"
 #include "engine/framework/core/backend.h"
 #include "engine/framework/core/module.h"
+#include "engine/framework/runtime/errors.h"
 #include "engine/framework/runtime/model.h"
 #include "engine/framework/runtime/registry.h"
 #include "engine/framework/runtime/session.h"
+#include "engine/framework/io/json.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -27,12 +33,24 @@
 #include <filesystem>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#ifdef GGML_BACKEND_DL
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+#endif
 
 namespace rt = engine::runtime;
 
@@ -41,6 +59,102 @@ namespace {
 thread_local std::string g_last_error;
 
 const char * const kEmptyString = "";
+
+struct LogCallbackState {
+    audiocpp_log_callback callback = nullptr;
+    void * user_data = nullptr;
+};
+
+std::mutex g_log_mutex;
+LogCallbackState g_log_state;
+
+audiocpp_log_level ggml_to_audiocpp_log_level(enum ggml_log_level level) {
+    switch (level) {
+    case GGML_LOG_LEVEL_DEBUG: return AUDIOCPP_LOG_LEVEL_DEBUG;
+    case GGML_LOG_LEVEL_INFO:  return AUDIOCPP_LOG_LEVEL_INFO;
+    case GGML_LOG_LEVEL_WARN:  return AUDIOCPP_LOG_LEVEL_WARN;
+    case GGML_LOG_LEVEL_ERROR: return AUDIOCPP_LOG_LEVEL_ERROR;
+    case GGML_LOG_LEVEL_CONT:  return AUDIOCPP_LOG_LEVEL_CONT;
+    case GGML_LOG_LEVEL_NONE:
+    default:
+        return AUDIOCPP_LOG_LEVEL_NONE;
+    }
+}
+
+audiocpp_log_level engine_to_audiocpp_log_level(engine::debug::LogLevel level) {
+    switch (level) {
+    case engine::debug::LogLevel::Debug:   return AUDIOCPP_LOG_LEVEL_DEBUG;
+    case engine::debug::LogLevel::Info:    return AUDIOCPP_LOG_LEVEL_INFO;
+    case engine::debug::LogLevel::Warning: return AUDIOCPP_LOG_LEVEL_WARN;
+    case engine::debug::LogLevel::Error:   return AUDIOCPP_LOG_LEVEL_ERROR;
+    default:
+        return AUDIOCPP_LOG_LEVEL_NONE;
+    }
+}
+
+void ggml_log_adapter(enum ggml_log_level level, const char * text, void * /*user_data*/) {
+    audiocpp_log_callback cb = nullptr;
+    void * ud = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        cb = g_log_state.callback;
+        ud = g_log_state.user_data;
+    }
+    if (cb) {
+        cb(ggml_to_audiocpp_log_level(level), text, ud);
+    }
+}
+
+void engine_log_adapter(engine::debug::LogLevel level, const char * text, void * /*user_data*/) {
+    audiocpp_log_callback cb = nullptr;
+    void * ud = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        cb = g_log_state.callback;
+        ud = g_log_state.user_data;
+    }
+    if (cb) {
+        cb(engine_to_audiocpp_log_level(level), text, ud);
+    }
+}
+
+#ifdef GGML_BACKEND_DL
+std::once_flag g_backend_load_once;
+
+void load_library_backends() {
+    std::call_once(g_backend_load_once, [] {
+        std::filesystem::path library_path;
+#ifdef _WIN32
+        HMODULE module = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&g_backend_load_once), &module)) {
+            throw std::runtime_error("Could not locate the audio.cpp DLL");
+        }
+        std::vector<wchar_t> path(512);
+        while (true) {
+            const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+            if (length == 0) {
+                throw std::runtime_error("Could not resolve the audio.cpp DLL path");
+            }
+            if (length < path.size()) {
+                library_path = std::wstring(path.data(), length);
+                break;
+            }
+            path.resize(path.size() * 2);
+        }
+#else
+        Dl_info info{};
+        if (dladdr(&g_backend_load_once, &info) == 0 || info.dli_fname == nullptr) {
+            throw std::runtime_error("Could not locate the audio.cpp shared library");
+        }
+        library_path = info.dli_fname;
+#endif
+        const auto directory = std::filesystem::canonical(library_path).parent_path().u8string();
+        ggml_backend_load_all_from_path(directory.c_str());
+    });
+}
+#endif
 
 /* Every entry point funnels through here: the framework throws, the ABI
  * returns codes. `runtime_status` lets a caller classify its own failures
@@ -55,6 +169,10 @@ audiocpp_status guard(Fn && fn, audiocpp_status runtime_status = AUDIOCPP_ERR_RU
         g_last_error = e.what();
         return AUDIOCPP_ERR_OUT_OF_MEMORY;
     } catch (const std::invalid_argument & e) {
+        g_last_error = e.what();
+        return AUDIOCPP_ERR_INVALID_ARGUMENT;
+    } catch (const rt::InvalidRequestError & e) {
+        /* Caller input such as a malformed option value: not a load or runtime failure. */
         g_last_error = e.what();
         return AUDIOCPP_ERR_INVALID_ARGUMENT;
     } catch (const std::exception & e) {
@@ -79,6 +197,8 @@ engine::core::BackendType parse_backend_type(const std::string & value) {
     if (value == "hip" || value == "rocm") return engine::core::BackendType::Hip;
     if (value == "vulkan") return engine::core::BackendType::Vulkan;
     if (value == "metal") return engine::core::BackendType::Metal;
+    if (value == "webgpu") return engine::core::BackendType::WebGPU;
+    if (value == "sycl") return engine::core::BackendType::Sycl;
     if (value == "best") return engine::core::BackendType::BestAvailable;
     throw std::invalid_argument("unsupported backend: " + value);
 }
@@ -192,7 +312,7 @@ struct audiocpp_request {
 
 struct audiocpp_result {
     rt::TaskResult result;
-    mutable std::optional<std::string> schema_json;
+    mutable std::optional<std::string> custom_schema_json;
     /* An event exposes its contents through a result view that it owns. The
      * view has the same type as an owned result and there is a public free for
      * that type, so freeing one has to be a no-op rather than a double free. */
@@ -275,6 +395,23 @@ const char * audiocpp_status_string(audiocpp_status status) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Logging                                                             */
+/* ------------------------------------------------------------------ */
+
+void audiocpp_log_set(audiocpp_log_callback log_callback, void * user_data) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    g_log_state.callback = log_callback;
+    g_log_state.user_data = user_data;
+    if (log_callback != nullptr) {
+        ggml_log_set(ggml_log_adapter, nullptr);
+        engine::debug::set_log_callback(engine_log_adapter, nullptr);
+    } else {
+        ggml_log_set(nullptr, nullptr);
+        engine::debug::set_log_callback(nullptr, nullptr);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Options                                                             */
 /* ------------------------------------------------------------------ */
 
@@ -310,6 +447,9 @@ audiocpp_status audiocpp_registry_create(const char * config_path, audiocpp_regi
     }
     *out_registry = nullptr;
     return guard([&] {
+#ifdef GGML_BACKEND_DL
+        load_library_backends();
+#endif
         auto handle = std::make_unique<audiocpp_registry>();
         auto config = config_path != nullptr
             ? std::optional<std::filesystem::path>(std::filesystem::path(config_path))
@@ -495,6 +635,14 @@ audiocpp_status audiocpp_session_create(const audiocpp_model * model,
                                         const audiocpp_backend_config * backend_config,
                                         const audiocpp_options * options,
                                         audiocpp_session ** out_session) {
+    return audiocpp_session_create_with_impl(
+        model, task, mode, backend_config, nullptr, options, out_session);
+}
+
+audiocpp_status audiocpp_session_create_with_impl(
+        const audiocpp_model * model, const char * task, const char * mode,
+        const audiocpp_backend_config * backend_config, const char * impl,
+        const audiocpp_options * options, audiocpp_session ** out_session) {
     if (model == nullptr || task == nullptr || mode == nullptr || out_session == nullptr) {
         return fail(AUDIOCPP_ERR_INVALID_ARGUMENT, "model, task, mode and out_session must be non-null");
     }
@@ -513,6 +661,7 @@ audiocpp_status audiocpp_session_create(const audiocpp_model * model,
             session_options.backend.device = backend_config->device;
             session_options.backend.threads = backend_config->threads;
         }
+        session_options.backend.impl = impl ? impl : "";
         session_options.options = option_map(options);
 
         auto handle = std::make_unique<audiocpp_session>();
@@ -639,9 +788,10 @@ audiocpp_status audiocpp_request_set_text(audiocpp_request * request, const char
         if (language != nullptr) transcript.language = language;
         request->request.text_input = std::move(transcript);
         /* audiocpp_cli's --language sets BOTH the transcript language and
-         * options["language"] (app/cli/request.cpp:336), and some families read
-         * only the latter. Mirroring that is what keeps this API's answers
-         * identical to the CLI's. A later audiocpp_request_set_option wins. */
+         * options["language"] (build_request_from_cli in app/cli/request.cpp),
+         * and some families read only the latter. Mirroring that is what keeps
+         * this API's answers identical to the CLI's. A later
+         * audiocpp_request_set_option wins. */
         if (language != nullptr && *language != '\0') {
             request->request.options["language"] = language;
         }
@@ -901,6 +1051,26 @@ audiocpp_status audiocpp_result_text(const audiocpp_result * result,
     return AUDIOCPP_OK;
 }
 
+audiocpp_status audiocpp_result_custom_schema(const audiocpp_result * result,
+                                              const char ** out_schema,
+                                              const char ** out_data) {
+    if (result == nullptr) {
+        return fail(AUDIOCPP_ERR_INVALID_ARGUMENT, "result must be non-null");
+    }
+    if (!result->result.custom_schema_output.has_value()) {
+        return fail(AUDIOCPP_ERR_NOT_AVAILABLE, "result carries no custom schema output");
+    }
+    return guard([&] {
+        const auto & output = *result->result.custom_schema_output;
+        if (out_data != nullptr && !result->custom_schema_json.has_value()) {
+            result->custom_schema_json = engine::io::json::stringify(output.data);
+        }
+        assign_out(out_schema, output.schema);
+        if (out_data != nullptr) assign_out(out_data, *result->custom_schema_json);
+        return AUDIOCPP_OK;
+    });
+}
+
 size_t audiocpp_result_segment_count(const audiocpp_result * result) {
     return result != nullptr ? result->result.speech_segments.size() : 0;
 }
@@ -999,23 +1169,6 @@ audiocpp_status audiocpp_result_named_audio(const audiocpp_result * result,
     if (out_sample_rate != nullptr) *out_sample_rate = named.audio.sample_rate;
     if (out_channels != nullptr) *out_channels = named.audio.channels;
     return AUDIOCPP_OK;
-}
-
-audiocpp_status audiocpp_result_schema_json(const audiocpp_result * result,
-                                           const char ** out_schema,
-                                           const char ** out_json) {
-    if (out_schema) *out_schema = nullptr;
-    if (out_json) *out_json = nullptr;
-    return guard([&] {
-        if (!result) return fail(AUDIOCPP_ERR_INVALID_ARGUMENT, "result must be non-null");
-        if (!result->result.custom_schema_output)
-            return fail(AUDIOCPP_ERR_NOT_AVAILABLE, "result has no schema output");
-        const auto & schema = *result->result.custom_schema_output;
-        if (!result->schema_json) result->schema_json = engine::io::json::stringify(schema.data);
-        assign_out(out_schema, schema.schema);
-        assign_out(out_json, *result->schema_json);
-        return AUDIOCPP_OK;
-    });
 }
 
 size_t audiocpp_result_artifact_count(const audiocpp_result * result) {

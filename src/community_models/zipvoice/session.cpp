@@ -1,5 +1,7 @@
 #include "engine/community_models/zipvoice/session.h"
 
+#include "engine/framework/debug/profiler.h"
+
 #include "engine/community_models/zipvoice/synthesize.h"
 
 #include "engine/framework/assets/tensor_source.h"
@@ -123,7 +125,10 @@ public:
             run_mode_ != runtime::RunMode::Streaming) {
             throw std::runtime_error("ZipVoice supports offline and streaming sessions only");
         }
-        runtime::validate_spec_backed_session_options(options, *contract_, kFamily, "ZipVoice");
+        auto validation_options = options;
+        validation_options.options.erase("zipvoice.shift");
+        validation_options.options.erase("zipvoice.t_shift");
+        runtime::validate_spec_backed_session_options(validation_options, *contract_, kFamily, "ZipVoice");
         // Vocos resolution order (f5_tts pattern):
         //   1. zipvoice.vocos_path session option
         //   2. bundled "vocos" namespace in the GGUF checkpoint
@@ -155,7 +160,7 @@ public:
         if (const auto v = runtime::find_option(options.options, {"zipvoice.guidance_scale", "guidance_scale"})) {
             guidance_scale_ = std::stof(*v);
         }
-        if (const auto v = runtime::find_option(options.options, {"zipvoice.t_shift", "t_shift"})) {
+        if (const auto v = runtime::find_option(options.options, {"zipvoice.shift", "shift", "zipvoice.t_shift", "t_shift"})) {
             t_shift_ = std::stof(*v);
         }
         if (const auto v = runtime::find_option(options.options, {"zipvoice.espeak_data_path", "espeak_data_path"})) {
@@ -178,6 +183,7 @@ public:
     }
 
     runtime::TaskResult run(const runtime::TaskRequest & request) override {
+        const auto wall_start = std::chrono::steady_clock::now();
         if (run_mode_ != runtime::RunMode::Offline) {
             throw std::runtime_error("ZipVoice run requires an offline session");
         }
@@ -194,6 +200,7 @@ public:
         if (merged.samples.empty()) throw std::invalid_argument("zipvoice: empty text chunks");
         runtime::TaskResult result;
         result.audio_output = std::move(merged);
+        engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(wall_start));
         return result;
     }
 
@@ -205,6 +212,7 @@ public:
     }
 
     void start_stream(const runtime::TaskRequest & request) override {
+        stream_wall_start_ = std::chrono::steady_clock::now();
         if (run_mode_ != runtime::RunMode::Streaming) {
             throw std::runtime_error("ZipVoice start_stream requires a streaming session");
         }
@@ -259,6 +267,7 @@ public:
         runtime::TaskResult result;
         result.audio_output = std::move(stream_merged_audio_);
         reset();
+        engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(stream_wall_start_));
         return result;
     }
 
@@ -310,7 +319,7 @@ private:
         req.tokenizer = "emilia";  // fixed frontend: zh/en/mixed via the Emilia pipeline
         req.espeak_library_path = espeak_library_path_;
         req.espeak_data_path = espeak_data_path_;
-        if (const auto v = runtime::find_option(request.options, {"lang"})) req.lang = *v;
+        if (const auto v = runtime::find_option(request.options, {"language", "lang"})) req.lang = *v;
         req.num_steps = num_steps_;
         req.guidance_scale = guidance_scale_;
         req.t_shift = t_shift_;
@@ -320,7 +329,7 @@ private:
         if (const auto v = runtime::find_option(request.options, {"guidance_scale", "cfg_strength"})) {
             req.guidance_scale = std::stof(*v);
         }
-        if (const auto v = runtime::find_option(request.options, {"t_shift"})) {
+        if (const auto v = runtime::find_option(request.options, {"shift", "t_shift"})) {
             req.t_shift = std::stof(*v);
         }
         if (const auto v = runtime::find_option(request.options, {"speed"})) {
@@ -364,6 +373,7 @@ private:
     std::vector<std::string> stream_text_chunks_;
     runtime::AudioBuffer stream_merged_audio_;
     std::size_t stream_chunk_index_ = 0;
+    std::chrono::steady_clock::time_point stream_wall_start_{};
     bool stream_started_ = false;
 };
 

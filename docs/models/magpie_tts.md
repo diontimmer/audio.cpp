@@ -24,7 +24,7 @@ audiocpp_cli --task tts --family magpie_tts \
   --backend cuda \
   --language en \
   --text "The production coordinator reviewed the overnight audio report and sent one clear update." \
-  --request-option voice_id=Sofia \
+  --voice-id Sofia \
   --out out.wav
 ```
 
@@ -61,7 +61,8 @@ That tokenizer path has not been ported to the native C++ frontend yet, so
 `ja` is intentionally not listed as supported here.
 
 `voice_id` accepts either a baked speaker name from the package speaker map or a
-numeric speaker index.
+numeric speaker index. `--voice-id` takes precedence over
+`--request-option voice_id=...`; both forms select the same baked voices.
 
 ## Common Options (use directly)
 
@@ -72,7 +73,7 @@ numeric speaker index.
 | `--top-k` | integer > 0 | `80` | Audio-token top-k sampling limit. |
 | `--guidance-scale` | float >= 0 | `2.5` | Classifier-free guidance scale for decoder logits. |
 | `--max-tokens` | integer > 0 | `500` | Maximum decoder frames per text segment. |
-| `--text-chunk-size` | integer > 0 | `300` | Long-form text chunk budget. |
+| `--text-chunk-size` | integer > 0 | `100` or `300` | Long-form text chunk budget: `100` for `zh` and `ko`, otherwise `300`. Each chunk is generated within `max_tokens`. |
 | `--text-chunk-mode` | `default`, `tag_aware`, `japanese`, `endline` | `default` | Framework text chunking mode. |
 | `--seed` | integer >= 0 | `0` | Audio-token sampling seed. |
 
@@ -81,12 +82,12 @@ numeric speaker index.
 | Option | Values | Default | Meaning |
 |---|---|---:|---|
 | `language` | language code | `en` | Target synthesis language used by the Magpie text frontend. |
-| `voice_id` | `Aria`, `Jason`, `John`, `Leo`, `Sofia`, or numeric index | `0` | Baked speaker context prompt. |
+| `voice_id` | `Aria`, `Jason`, `John`, `Leo`, `Sofia`, or numeric index | `0` | Packaged MagpieTTS voice name; default Aria. Numeric speaker index strings are also accepted within the checkpoint speaker count. |
 | `temperature` | float >= 0 | `0.6` | Audio-token sampling temperature. |
 | `top_k` | integer > 0 | `80` | Audio-token top-k sampling limit. |
 | `guidance_scale` | float >= 0 | `2.5` | Classifier-free guidance scale for decoder logits. |
 | `max_tokens` | integer > 0 | `500` | Maximum decoder frames per text segment. |
-| `text_chunk_size` | integer > 0 | `300` | Long-form text chunk budget. |
+| `text_chunk_size` | integer > 0 | `100` or `300` | Long-form text chunk budget: `100` for `zh` and `ko`, otherwise `300`. Each chunk is generated within `max_tokens`. |
 | `text_chunk_mode` | `default`, `tag_aware`, `japanese`, `endline` | `default` | Framework text chunking mode. |
 | `seed` | integer >= 0 | `0` | Audio-token sampling seed. |
 
@@ -94,7 +95,7 @@ numeric speaker index.
 
 | Option | Values | Default | Meaning |
 |---|---|---:|---|
-| `magpie_tts.graph_arena_mb` | integer MiB | `1024` | Reusable graph arena size for Magpie stages. |
-| `magpie_tts.weight_context_mb` | integer MiB | `2048` | Weight metadata arena size. |
+| `magpie_tts.graph_arena_mb` | integer MiB | `32` | Main-stage graph metadata arena. Local codebook graphs use a separate fixed 64 MiB arena. |
+| `magpie_tts.weight_context_mb` | integer MiB | `8` | Weight metadata arena size. |
 | `magpie_tts.weight_type` | `native`, `f32`, `f16`, `bf16`, `q8_0` | `native` | Matmul weight storage type when supported. |
 | `magpie_tts.conv_weight_type` | `native`, `f32`, `f16` | `native` | Convolution weight storage type when supported. |

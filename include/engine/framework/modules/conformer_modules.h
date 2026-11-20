@@ -3,6 +3,7 @@
 #include "engine/framework/core/module.h"
 #include "engine/framework/modules/attention_modules.h"
 #include "engine/framework/modules/linear_module.h"
+#include "engine/framework/modules/feed_forward_modules.h"
 #include "engine/framework/modules/norm_modules.h"
 #include "engine/framework/modules/streaming_conv_modules.h"
 
@@ -36,6 +37,32 @@ struct ConvSubsamplingWeights {
 struct ConvSubsamplingOutputs {
     core::TensorValue output;
     core::TensorValue lengths;
+};
+
+struct EspnetConv2dSubsampling8Config {
+    int64_t input_features = 0;
+    int64_t hidden_size = 0;
+    int64_t time_row_alignment = 1;
+};
+
+struct EspnetConv2dSubsampling8Weights {
+    Conv2dWeights conv0;
+    Conv2dWeights conv1;
+    Conv2dWeights conv2;
+    LinearWeights projection;
+};
+
+class EspnetConv2dSubsampling8Module {
+public:
+    explicit EspnetConv2dSubsampling8Module(EspnetConv2dSubsampling8Config config);
+    // Input/output are [batch, time, features]. Three unpadded stride-2 convolutions.
+    core::TensorValue build(
+        core::ModuleBuildContext & ctx,
+        const core::TensorValue & input,
+        const EspnetConv2dSubsampling8Weights & weights) const;
+
+private:
+    EspnetConv2dSubsampling8Config config_;
 };
 
 struct DepthwiseConvSubsamplingConfig {
@@ -137,6 +164,9 @@ struct ConformerBlockConfig {
     int64_t right_context = -1;
     int64_t cache_drop_size = 0;
     bool contiguous_glu_gate = false;
+    FeedForwardActivation ffn_activation = FeedForwardActivation::Silu;
+    // Offline relative attention's original ESPnet T-row positional layout.
+    bool legacy_position_layout = false;
 };
 
 struct ConformerBlockWeights {

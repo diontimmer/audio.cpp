@@ -2,11 +2,12 @@
   "schema_version": 1,
   "family": "kugelaudio",
   "display_name": "KugelAudio-0-Open",
-  "description": "KugelAudio text-to-speech with bundled preset voices and incremental audio output.",
+  "description": "KugelAudio text-to-speech with preset voices, optional acoustic-encoder reference-audio cloning, and incremental output.",
   "category": "tts",
   "status": "experimental",
   "tasks": [
-    "tts"
+    "tts",
+    "clone"
   ],
   "modes": [
     "offline",
@@ -45,6 +46,9 @@
   "capabilities": {
     "tts": [
       "long_form"
+    ],
+    "clone": [
+      "speaker_reference"
     ]
   },
   "options": {
@@ -65,7 +69,7 @@
       {
         "name": "num_inference_steps",
         "type": "int",
-        "description": "Diffusion steps per generated acoustic frame.",
+        "description": "Diffusion steps per acoustic frame, from 1 to 1000; omitted uses the checkpoint's diffusion_head_config.ddpm_num_inference_steps.",
         "min": 1,
         "max": 1000,
         "default": 20,
@@ -74,8 +78,7 @@
       {
         "name": "guidance_scale",
         "type": "float",
-        "description": "Diffusion classifier-free guidance; 1 disables the unconditional pass.",
-        "min": 0,
+        "description": "Diffusion classifier-free guidance; 1 disables the unconditional pass. Any finite value is accepted; negative values enter CFG arithmetic.",
         "default": 3,
         "required": false
       },
@@ -97,8 +100,7 @@
       {
         "name": "temperature",
         "type": "float",
-        "description": "Autoregressive sampling temperature when do_sample is enabled.",
-        "min": 0,
+        "description": "Autoregressive sampling temperature when do_sample is enabled. Any finite value is accepted; negative values disable sampling.",
         "default": 1,
         "required": false
       },
@@ -155,6 +157,12 @@
         ],
         "description": "Weight storage type; native preserves packaged tensor types.",
         "default": "native",
+        "required": false
+      },
+      {
+        "name": "reference_encoder_path",
+        "type": "string",
+        "description": "Optional local GGUF or safetensors acoustic-encoder weights. Required for reference-audio cloning when the main GGUF omits its encoder. Preset voices do not use this file.",
         "required": false
       }
     ],
@@ -219,7 +227,8 @@
     "tags": [
       "TTS",
       "Stream",
-      "GGUF"
+      "GGUF",
+      "Clone"
     ],
     "docs": [
       "docs/models/kugelaudio.md",
@@ -240,6 +249,12 @@
       },
       "tensors": {
         "model_weights": "weights:"
+      },
+      "optional_tensors": {
+        "reference_encoder_weights": {
+          "source": "weights:",
+          "prefix": "reference_encoder"
+        }
       }
     }
   ]

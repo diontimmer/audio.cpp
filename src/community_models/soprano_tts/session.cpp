@@ -98,13 +98,22 @@ SopranoTTSOfflineSession::SopranoTTSOfflineSession(
       task_(task),
       assets_(require_assets(std::move(assets))),
       contract_(require_contract(std::move(contract))) {
-    runtime::validate_spec_backed_session_options(options, *contract_, kFamily, "Soprano");
+    const auto normalized_options = runtime::apply_option_v1_compatibility(
+        options,
+        {{"backbone_weight_type", "soprano_tts.backbone_weight_type"},
+         {"decoder_weight_type", "soprano_tts.decoder_weight_type"},
+         {"text_chunk_size", "soprano_tts.text_chunk_size"}},
+        "Soprano");
+    auto validation_options = normalized_options;
+    // Older embedded specs classify the weight controls as load options.
+    validation_options.options.erase("soprano_tts.backbone_weight_type");
+    validation_options.options.erase("soprano_tts.decoder_weight_type");
+    validation_options.options.erase("soprano_tts.text_chunk_size");
+    runtime::validate_spec_backed_session_options(validation_options, *contract_, kFamily, "Soprano");
     core::ExecutionContext & execution = execution_context();
-    // Spec-declared session/load options are validated against their bare
-    // names, so only those spellings are accepted (no prefixed aliases).
     const auto backbone_storage = runtime::parse_tensor_storage_option(
-        options.options,
-        "backbone_weight_type",
+        normalized_options.options,
+        "soprano_tts.backbone_weight_type",
         assets::TensorStorageType::F32,
         {assets::TensorStorageType::Native,
          assets::TensorStorageType::F32,
@@ -112,8 +121,8 @@ SopranoTTSOfflineSession::SopranoTTSOfflineSession(
          assets::TensorStorageType::BF16,
          assets::TensorStorageType::Q8_0});
     const auto decoder_storage = runtime::parse_tensor_storage_option(
-        options.options,
-        "decoder_weight_type",
+        normalized_options.options,
+        "soprano_tts.decoder_weight_type",
         assets::TensorStorageType::F32,
         {assets::TensorStorageType::Native,
          assets::TensorStorageType::F32,
@@ -153,6 +162,7 @@ void SopranoTTSOfflineSession::prepare(const runtime::SessionPreparationRequest 
 
 
 runtime::TaskResult SopranoTTSOfflineSession::run(const runtime::TaskRequest & request) {
+    const auto wall_start = std::chrono::steady_clock::now();
     require_prepared("Soprano run");
     if (task_.mode != runtime::RunMode::Offline) {
         throw std::runtime_error("Soprano run requires an offline session");
@@ -162,6 +172,7 @@ runtime::TaskResult SopranoTTSOfflineSession::run(const runtime::TaskRequest & r
 
     runtime::TaskResult result;
     result.audio_output = audio;
+    engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(wall_start));
     return result;
 }
 
@@ -170,7 +181,7 @@ runtime::AudioBuffer SopranoTTSOfflineSession::synthesize(const SopranoRequest &
         assets_->resources.require_file("tokenizer_json");
     SopranoTextTokenizer tokenizer(tokenizer_path);
     const int64_t chunk_codepoints = runtime::parse_i64_option(
-        options().options, {"text_chunk_size"})
+        options().options, {"soprano_tts.text_chunk_size", "text_chunk_size"})
         .value_or(200);
     const auto chunks = engine::text::split_text_chunks(
         request.text, chunk_codepoints, engine::text::TextChunkMode::Default);
@@ -212,6 +223,7 @@ runtime::StreamingPolicy SopranoTTSOfflineSession::streaming_policy() const {
     return policy;
 }
 void SopranoTTSOfflineSession::start_stream(const runtime::TaskRequest & request) {
+    stream_wall_start_ = std::chrono::steady_clock::now();
     require_prepared("Soprano start_stream");
     runtime::validate_spec_backed_request_options(request.options, *contract_, "Soprano");
     if (task_.mode != runtime::RunMode::Streaming) {
@@ -221,7 +233,7 @@ void SopranoTTSOfflineSession::start_stream(const runtime::TaskRequest & request
     // Parse the request (and its sampling options) once, then keep one full
     // request per text chunk so next_stream_event honors the user options.
     const auto chunk_codepoints = runtime::parse_i64_option(
-        options().options, {"text_chunk_size"}).value_or(200);
+        options().options, {"soprano_tts.text_chunk_size", "text_chunk_size"}).value_or(200);
     const auto chunks = engine::text::split_text_chunks(
         request_text(request), chunk_codepoints, engine::text::TextChunkMode::Default);
     SopranoRequest parsed;
@@ -277,6 +289,7 @@ runtime::TaskResult SopranoTTSOfflineSession::finish_stream() {
     }
     result.audio_output = std::move(merged);
     reset();
+    engine::debug::timing_log_scalar("session.wall_ms", engine::debug::elapsed_ms(stream_wall_start_));
     return result;
 }
 void SopranoTTSOfflineSession::reset() {

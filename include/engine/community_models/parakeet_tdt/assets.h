@@ -8,9 +8,12 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace engine::community_models::parakeet_tdt {
+
+struct ParakeetImplementation;
 
 struct ParakeetFrontendConfig {
     int64_t sample_rate = 16000;
@@ -36,6 +39,9 @@ struct ParakeetFastConformerConfig {
 };
 
 struct ParakeetConfig {
+    std::string variant;
+    std::string word_timestamp_mode = "default";
+    std::vector<int32_t> punctuation_token_ids;
     std::string model_type;
     int64_t vocab_size = 8193;
     int64_t blank_token_id = 8192;
@@ -49,6 +55,7 @@ struct ParakeetConfig {
 };
 
 struct ParakeetTDTAssets {
+    const ParakeetImplementation * impl = nullptr;
     assets::ResourceBundle resources;
     ParakeetConfig config;
     std::shared_ptr<const assets::TensorSource> source;
@@ -56,6 +63,7 @@ struct ParakeetTDTAssets {
     std::vector<uint8_t> special_token_ids;
 };
 
-std::shared_ptr<const ParakeetTDTAssets> load_parakeet_assets(const std::filesystem::path & model_path);
+std::shared_ptr<const ParakeetTDTAssets> load_parakeet_assets(
+    const std::filesystem::path & model_path, std::string_view family = "parakeet_tdt");
 
 }  // namespace engine::community_models::parakeet_tdt

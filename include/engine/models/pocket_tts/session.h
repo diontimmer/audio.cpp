@@ -4,7 +4,7 @@
 #include "engine/framework/runtime/cache_slots.h"
 #include "engine/framework/runtime/session_base.h"
 #include "engine/models/pocket_tts/acoustic_model.h"
-#include "engine/models/pocket_tts/audio_decoder.h"
+#include "engine/framework/codecs/mimi_codec_runtime.h"
 #include "engine/models/pocket_tts/flow_lm.h"
 #include "engine/models/pocket_tts/text_conditioner.h"
 #include "engine/models/pocket_tts/voice_conditioner.h"
@@ -13,6 +13,9 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <unordered_map>
+
+namespace engine::model_spec { struct ModelContract; }
 
 namespace engine::models::pocket_tts {
 
@@ -46,7 +49,8 @@ public:
         runtime::TaskSpec task,
         runtime::SessionOptions options,
         std::shared_ptr<const PocketTTSAssets> manifest,
-        std::filesystem::path model_dir);
+        std::filesystem::path model_dir,
+        std::shared_ptr<const engine::model_spec::ModelContract> request_contract = nullptr);
     ~PocketTTSSession();
 
     PocketTTSSession(const PocketTTSSession &) = delete;
@@ -84,18 +88,21 @@ private:
     AcousticCapacitySelection select_acoustic_capacities(int64_t prompt_steps, int max_steps) const;
     GenerationRequest effective_request_for_run(const runtime::TaskRequest & request) const;
     bool start_next_stream_text_chunk();
+    void validate_request_options(const std::unordered_map<std::string, std::string> & options) const;
     std::vector<int64_t> prepared_prompt_capacities() const;
     std::vector<int64_t> prepared_generation_capacities() const;
 
     runtime::TaskSpec task_;
     std::shared_ptr<const PocketTTSAssets> manifest_;
     std::filesystem::path model_dir_;
+    // set by families that reject unknown request options; pocket_tts leaves it empty
+    std::shared_ptr<const engine::model_spec::ModelContract> request_contract_;
     PocketTTSGraphCapacityConfig graph_capacity_;
     std::shared_ptr<const PocketTTSBackendWeights> weights_;
     TextConditioner text_conditioner_;
     VoiceConditioner voice_conditioner_;
     AcousticModel acoustic_model_;
-    AudioDecoder audio_decoder_;
+    codecs::MimiLatentDecoderRuntime audio_decoder_;
     runtime::CacheSlots<std::string, FlowLMState> cached_voice_states_;
     GenerationRequest prepared_session_request_;
     runtime::GraphCapacityController prompt_capacity_controller_;

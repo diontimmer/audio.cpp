@@ -4,6 +4,8 @@
 #include "engine/framework/runtime/options.h"
 #include "engine/framework/runtime/spec_backed_model.h"
 
+#include "word_timestamps.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -46,14 +48,12 @@ std::filesystem::path session_path(
 void validate_session_options(
     const runtime::SessionOptions & options,
     const engine::model_spec::ModelContract & contract) {
-    const std::string family_prefix = std::string(kFamily) + ".";
-    for (const auto & [key, _] : options.options) {
-        if (key.rfind(family_prefix, 0) == 0 &&
-            contract.session_option_keys.find(key) ==
-                contract.session_option_keys.end()) {
-            throw std::runtime_error("unknown sanoTTS session option: " + key);
-        }
+    auto validation_options = options;
+    // Older embedded contracts omit exec_plan; parse_exec_plan validates its value.
+    if (contract.session_option_keys.find("sanotts.exec_plan") == contract.session_option_keys.end()) {
+        validation_options.options.erase("sanotts.exec_plan");
     }
+    runtime::validate_spec_backed_session_options(validation_options, contract, kFamily, "sanoTTS");
 }
 
 int64_t chunk_size_from_request(const runtime::TaskRequest & request) {
@@ -85,13 +85,24 @@ struct RequestOptions {
 
 RequestOptions parse_request_options(const runtime::TaskRequest & request) {
     RequestOptions out;
-    if (const auto value = runtime::parse_finite_float_option(
-            request.options,
-            {"speaking_rate"})) {
-        out.speaking_rate = *value;
+    const auto legacy_rate = runtime::parse_finite_float_option(request.options, {"speaking_rate"});
+    const auto speed = runtime::parse_finite_float_option(request.options, {"speed"});
+    if (legacy_rate) {
+        out.speaking_rate = *legacy_rate;
     }
     if (out.speaking_rate < 0.5F || out.speaking_rate > 2.0F) {
         throw std::runtime_error("sanoTTS speaking_rate must be between 0.5 and 2.0");
+    }
+    if (speed) {
+        if (*speed < 0.5F || *speed > 2.0F) {
+            throw std::runtime_error("sanoTTS speed must be between 0.5 and 2.0");
+        }
+        // Keep duration rounding and clamping in the existing decoder path.
+        const float duration_scale = 1.0F / *speed;
+        if (legacy_rate && *legacy_rate != duration_scale) {
+            throw std::runtime_error("sanoTTS speed and speaking_rate must be reciprocals when both are supplied");
+        }
+        out.speaking_rate = duration_scale;
     }
     if (const auto value = runtime::parse_i64_option(request.options, {"seed"})) {
         if (*value < 0) {
@@ -101,6 +112,45 @@ RequestOptions parse_request_options(const runtime::TaskRequest & request) {
         out.seed_from_text = *value == 0;
     }
     return out;
+}
+
+bool request_return_timestamps(const runtime::TaskRequest & request) {
+    if (const auto value = runtime::find_option(request.options, {"return_timestamps"})) {
+        return runtime::parse_bool_option(*value, "return_timestamps");
+    }
+    return false;
+}
+
+// Word spans for one chunk (see word_timestamps.h). Token t covers frames
+// [sum(d[<t]), sum(d[<=t])); the iSTFT output drops hop/2 samples at the
+// front, so a frame boundary f sits at f*hop - hop/2.
+void append_word_timestamps(
+    std::vector<runtime::WordTimestamp> & out,
+    const std::string & text,
+    const std::vector<int32_t> & token_ids,
+    const std::vector<int64_t> & token_frames,
+    const word_timestamps::WordPhonemizer & phonemize_word,
+    int64_t hop_length,
+    int64_t offset_samples,
+    int64_t chunk_samples) {
+    const auto to_sample = [&](int64_t frame) {
+        const int64_t local = std::clamp<int64_t>(
+            frame * hop_length - hop_length / 2, 0, chunk_samples);
+        return offset_samples + local;
+    };
+    const auto groups = word_timestamps::phoneme_word_ranges(
+        token_ids,
+        token_frames,
+        [](int32_t id) { return SanoTtsFrontend::symbol_for_id(id); });
+    for (const auto & labeled : word_timestamps::label_ranges(
+             groups, word_timestamps::text_words(text), phonemize_word)) {
+        runtime::WordTimestamp stamp;
+        stamp.span.start_sample = to_sample(labeled.frames.start);
+        stamp.span.end_sample = to_sample(labeled.frames.end);
+        stamp.word = labeled.label;
+        stamp.confidence = 1.0F;
+        out.push_back(std::move(stamp));
+    }
 }
 
 void append_pause(runtime::AudioBuffer & output, double seconds) {
@@ -128,13 +178,28 @@ SanoTtsSession::SanoTtsSession(
         throw std::runtime_error("sanoTTS only supports offline TTS");
     }
     validate_session_options(options, *contract_);
+    const auto exec_plan = runtime::parse_exec_plan(
+        options.options,
+        "sanotts.exec_plan",
+        {{"decoder", "default",
+          {{"default", {options.backend.type}, {}, {}},
+           {"ggml", {options.backend.type}, {}, {}},
+           {"neon", {core::BackendType::Cpu}, {}, {}}}}});
+    const auto & decoder_plan = exec_plan.at("decoder");
+    const auto cpu_decoder = decoder_plan.impl == "neon" ? SanoTtsCpuDecoder::Neon
+        : decoder_plan.impl == "ggml" ? SanoTtsCpuDecoder::Ggml
+        : SanoTtsCpuDecoder::Auto;
     if (assets_->graph == SanoTtsGraph::Nano) {
         frontend_ = std::make_unique<SanoTtsFrontend>(
             session_path(options, "sanotts.espeak_library_path"),
             session_path(options, "sanotts.espeak_data_path"),
             assets_->config.duration_max_tokens);
-        runtime_ = std::make_unique<SanoTtsNativeRuntime>(assets_, options.backend);
+        runtime_ = std::make_unique<SanoTtsNativeRuntime>(
+            assets_, options.backend, cpu_decoder);
     } else {
+        if (decoder_plan.impl == "neon") {
+            throw std::runtime_error("sanotts.exec_plan.decoder: NEON requires a Nano-lineage model");
+        }
         piper_frontend_ = std::make_unique<SanoTtsPiperFrontend>(
             session_path(options, "sanotts.espeak_library_path"),
             session_path(options, "sanotts.espeak_data_path"),
@@ -182,8 +247,31 @@ runtime::TaskResult SanoTtsSession::run(const runtime::TaskRequest & request) {
     }
 
     const auto request_options = parse_request_options(request);
+    const bool want_words = request_return_timestamps(request) && runtime_ != nullptr;
+    std::vector<runtime::WordTimestamp> words;
     runtime::AudioBuffer merged;
     uint64_t rendered_chunks = 0;
+    // Pronounces one word on its own, for aligning word labels when the
+    // phoneme groups do not line up with the words. Empty when unavailable.
+    const word_timestamps::WordPhonemizer phonemize_word =
+        [&](const std::string & word) -> std::string {
+        if (frontend_ == nullptr) {
+            return {};
+        }
+        try {
+            const auto encoded = frontend_->encode(word);
+            std::string phonemes;
+            for (const auto id : encoded.token_ids) {
+                const std::string symbol = SanoTtsFrontend::symbol_for_id(id);
+                if (word_timestamps::is_phoneme_symbol(symbol)) {
+                    phonemes += symbol;
+                }
+            }
+            return phonemes;
+        } catch (const std::exception &) {
+            return {};
+        }
+    };
     // Renders one chunk, bisecting at whitespace when it phonemizes past the
     // duration model's token limit -- the codepoint budget cannot see phoneme
     // counts, so a dense 280-codepoint chunk can exceed 207 tokens.
@@ -230,7 +318,22 @@ runtime::TaskResult SanoTtsSession::run(const runtime::TaskRequest & request) {
                 chunk_options.seed = request_options.seed_from_text
                     ? sanotts_text_seed(chunk)
                     : request_options.seed + rendered_chunks;
-                audio = runtime_->synthesize(encoded.token_ids, chunk_options);
+                std::vector<int64_t> token_frames;
+                audio = runtime_->synthesize(
+                    encoded.token_ids,
+                    chunk_options,
+                    want_words ? &token_frames : nullptr);
+                if (want_words) {
+                    append_word_timestamps(
+                        words,
+                        chunk,
+                        encoded.token_ids,
+                        token_frames,
+                        phonemize_word,
+                        assets_->config.hop_length,
+                        static_cast<int64_t>(merged.samples.size()),
+                        static_cast<int64_t>(audio.samples.size()));
+                }
             } else {
                 // The piperlite decoder is deterministic; the seed option is
                 // documented as ignored for these voices.
@@ -258,6 +361,7 @@ runtime::TaskResult SanoTtsSession::run(const runtime::TaskRequest & request) {
         static_cast<int64_t>(chunks.size()));
     runtime::TaskResult result;
     result.audio_output = std::move(merged);
+    result.word_timestamps = std::move(words);
     return result;
 }
 

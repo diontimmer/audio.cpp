@@ -12,6 +12,8 @@ struct NormConfig {
     bool use_weight = true;
     bool use_bias = true;
     bool preserve_input_layout = false;
+    bool cuda_f16_output = false;
+    std::optional<ggml_type> normalized_round_type = std::nullopt;
 };
 
 struct NormWeights {
@@ -42,9 +44,14 @@ private:
     NormConfig config_;
 };
 
+enum class RMSNormLowering {
+    Default,
+    Vectorized,
+};
+
 class RMSNormModule {
 public:
-    explicit RMSNormModule(NormConfig config);
+    explicit RMSNormModule(NormConfig config, RMSNormLowering lowering = RMSNormLowering::Default);
 
     const core::ModuleSchema & schema() const noexcept;
     const NormConfig & config() const noexcept;
@@ -58,11 +65,12 @@ public:
 
 private:
     NormConfig config_;
+    RMSNormLowering lowering_;
 };
 
 class GemmaRMSNormModule {
 public:
-    explicit GemmaRMSNormModule(NormConfig config);
+    explicit GemmaRMSNormModule(NormConfig config, RMSNormLowering lowering = RMSNormLowering::Default);
 
     const core::ModuleSchema & schema() const noexcept;
     const NormConfig & config() const noexcept;
@@ -76,6 +84,7 @@ public:
 
 private:
     NormConfig config_;
+    RMSNormLowering lowering_;
 };
 
 struct GroupNormConfig {
@@ -84,6 +93,9 @@ struct GroupNormConfig {
     float eps = 1e-5F;
     bool use_weight = true;
     bool use_bias = true;
+    bool cuda_f16_output = false;
+    // Metal: row normalization avoids GroupNorm's missing batch handling and 32-thread bottleneck.
+    bool metal_row_norm = false;
 };
 
 class GroupNormModule {

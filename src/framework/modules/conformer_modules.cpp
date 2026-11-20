@@ -6,6 +6,7 @@
 #include "engine/framework/modules/structural_modules.h"
 
 #include <stdexcept>
+#include <algorithm>
 
 namespace engine::modules {
 
@@ -178,6 +179,60 @@ ConvSubsamplingOutputs ConvSubsamplingModule::build(
     };
 }
 
+EspnetConv2dSubsampling8Module::EspnetConv2dSubsampling8Module(EspnetConv2dSubsampling8Config config)
+    : config_(config) {
+    if (config_.input_features < 15 || config_.hidden_size <= 0 || config_.time_row_alignment <= 0) {
+        throw std::runtime_error("Invalid ESPnet Conv2D subsampling dimensions or row alignment");
+    }
+}
+
+core::TensorValue EspnetConv2dSubsampling8Module::build(
+    core::ModuleBuildContext & ctx,
+    const core::TensorValue & input,
+    const EspnetConv2dSubsampling8Weights & weights) const {
+    core::validate_rank_between(input, 3, 3, "input");
+    core::validate_last_dim(input, config_.input_features, "input");
+    const auto batch = input.shape.dims[0];
+    const auto frames = input.shape.dims[1];
+    if (frames < 15) {
+        throw std::runtime_error("ESPnet Conv2D subsampling requires at least 15 input frames");
+    }
+    const auto d = config_.hidden_size;
+    const auto alignment = config_.time_row_alignment;
+    auto x = core::reshape_tensor(ctx, input,
+        core::TensorShape::from_dims({batch, 1, frames, config_.input_features}));
+    int64_t valid_frames = (frames - 3) / 2 + 1;
+    if (alignment > 1) {
+        // Align the second convolution by padding the small input, not its activation.
+        const auto next_frames = (valid_frames - 3) / 2 + 1;
+        const auto aligned_next_frames = ((next_frames + alignment - 1) / alignment) * alignment;
+        const auto padded_input_frames = 2 * (2 * aligned_next_frames + 1) + 1;
+        x = Pad2dModule({0, 0, 0, std::max<int64_t>(0, padded_input_frames - frames)}).build(ctx, x);
+    }
+    x = Conv2dModule({1, d, 3, 3, 2, 2, 0, 0, 1, 1, true}).build(ctx, x, weights.conv0);
+    x = ReluModule().build(ctx, x);
+    for (const auto * conv : {&weights.conv1, &weights.conv2}) {
+        const auto output_frames = (valid_frames - 3) / 2 + 1;
+        const auto padded_frames = ((output_frames + alignment - 1) / alignment) * alignment;
+        const auto pad_frames = std::max<int64_t>(0, 2 * padded_frames + 1 - x.shape.dims[2]);
+        if (pad_frames > 0) {
+            x = Pad2dModule({0, 0, 0, pad_frames}).build(ctx, x);
+        }
+        x = Conv2dModule({d, d, 3, 3, 2, 2, 0, 0, 1, 1, true}).build(ctx, x, *conv);
+        if (padded_frames != output_frames) {
+            x = SliceModule({2, 0, output_frames}).build(ctx, x);
+        }
+        x = ReluModule().build(ctx, x);
+        valid_frames = output_frames;
+    }
+    const auto flattened_features = d * x.shape.dims[3];
+    x = TransposeModule({{0, 2, 1, 3}, 4}).build(ctx, x);
+    x = core::ensure_backend_addressable_layout(ctx, x);
+    x = core::reshape_tensor(ctx, x,
+        core::TensorShape::from_dims({batch, valid_frames, flattened_features}));
+    return LinearModule({flattened_features, d, true}).build(ctx, x, weights.projection);
+}
+
 DepthwiseConvSubsamplingModule::DepthwiseConvSubsamplingModule(DepthwiseConvSubsamplingConfig config)
     : config_(config) {
     if (config.input_features <= 0 || config.output_features <= 0 || config.conv_channels <= 0 ||
@@ -310,9 +365,11 @@ core::TensorValue ConformerBlockModule::build(
     const ConformerBlockWeights & weights) const {
     auto x = input;
     x = LayerNormModule({config_.hidden_size, config_.eps, true, true}).build(ctx, x, weights.ffn1_norm);
-    auto ff1 = LinearModule({config_.hidden_size, config_.intermediate_size, config_.use_bias}).build(ctx, x, weights.ffn1_fc1);
-    ff1 = SiluModule().build(ctx, ff1);
-    ff1 = LinearModule({config_.intermediate_size, config_.hidden_size, config_.use_bias}).build(ctx, ff1, weights.ffn1_fc2);
+    FeedForwardConfig ffn_config{config_.hidden_size, config_.intermediate_size, config_.use_bias};
+    ffn_config.activation = config_.ffn_activation;
+    const FeedForwardModule ffn(ffn_config);
+    auto ff1 = ffn.build(ctx, x, {weights.ffn1_fc1.weight, weights.ffn1_fc1.bias,
+        weights.ffn1_fc2.weight, weights.ffn1_fc2.bias});
     auto ff1_half = core::wrap_tensor(ggml_scale(ctx.ggml, ff1.tensor, 0.5f), ff1.shape, GGML_TYPE_F32);
     x = core::wrap_tensor(ggml_add(ctx.ggml, input.tensor, ff1_half.tensor), input.shape, GGML_TYPE_F32);
 
@@ -324,9 +381,8 @@ core::TensorValue ConformerBlockModule::build(
     x = core::wrap_tensor(ggml_add(ctx.ggml, x.tensor, y.tensor), x.shape, GGML_TYPE_F32);
 
     y = LayerNormModule({config_.hidden_size, config_.eps, true, true}).build(ctx, x, weights.norm2);
-    y = LinearModule({config_.hidden_size, config_.intermediate_size, config_.use_bias}).build(ctx, y, weights.ffn2_fc1);
-    y = SiluModule().build(ctx, y);
-    y = LinearModule({config_.intermediate_size, config_.hidden_size, config_.use_bias}).build(ctx, y, weights.ffn2_fc2);
+    y = ffn.build(ctx, y, {weights.ffn2_fc1.weight, weights.ffn2_fc1.bias,
+        weights.ffn2_fc2.weight, weights.ffn2_fc2.bias});
     auto y_half = core::wrap_tensor(ggml_scale(ctx.ggml, y.tensor, 0.5f), y.shape, GGML_TYPE_F32);
     x = core::wrap_tensor(ggml_add(ctx.ggml, x.tensor, y_half.tensor), x.shape, GGML_TYPE_F32);
 
@@ -346,9 +402,11 @@ core::TensorValue RelativeConformerBlockModule::build(
     const std::optional<core::TensorValue> & projected_pos_emb) const {
     auto x = input;
     x = LayerNormModule({config_.hidden_size, config_.eps, true, true}).build(ctx, x, weights.ffn1_norm);
-    auto ff1 = LinearModule({config_.hidden_size, config_.intermediate_size, config_.use_bias}).build(ctx, x, weights.ffn1_fc1);
-    ff1 = SiluModule().build(ctx, ff1);
-    ff1 = LinearModule({config_.intermediate_size, config_.hidden_size, config_.use_bias}).build(ctx, ff1, weights.ffn1_fc2);
+    FeedForwardConfig ffn_config{config_.hidden_size, config_.intermediate_size, config_.use_bias};
+    ffn_config.activation = config_.ffn_activation;
+    const FeedForwardModule ffn(ffn_config);
+    auto ff1 = ffn.build(ctx, x, {weights.ffn1_fc1.weight, weights.ffn1_fc1.bias,
+        weights.ffn1_fc2.weight, weights.ffn1_fc2.bias});
     auto ff1_half = core::wrap_tensor(ggml_scale(ctx.ggml, ff1.tensor, 0.5f), ff1.shape, GGML_TYPE_F32);
     x = core::wrap_tensor(ggml_add(ctx.ggml, input.tensor, ff1_half.tensor), input.shape, GGML_TYPE_F32);
 
@@ -360,6 +418,8 @@ core::TensorValue RelativeConformerBlockModule::build(
         config_.left_context,
         config_.right_context,
         config_.cache_drop_size,
+        false,
+        config_.legacy_position_layout,
     }).build(ctx, y, pos_emb, weights.self_attention, attention_mask, query_keep_mask, projected_pos_emb);
     x = core::wrap_tensor(ggml_add(ctx.ggml, x.tensor, y.tensor), x.shape, GGML_TYPE_F32);
 
@@ -367,9 +427,8 @@ core::TensorValue RelativeConformerBlockModule::build(
     x = core::wrap_tensor(ggml_add(ctx.ggml, x.tensor, y.tensor), x.shape, GGML_TYPE_F32);
 
     y = LayerNormModule({config_.hidden_size, config_.eps, true, true}).build(ctx, x, weights.norm2);
-    y = LinearModule({config_.hidden_size, config_.intermediate_size, config_.use_bias}).build(ctx, y, weights.ffn2_fc1);
-    y = SiluModule().build(ctx, y);
-    y = LinearModule({config_.intermediate_size, config_.hidden_size, config_.use_bias}).build(ctx, y, weights.ffn2_fc2);
+    y = ffn.build(ctx, y, {weights.ffn2_fc1.weight, weights.ffn2_fc1.bias,
+        weights.ffn2_fc2.weight, weights.ffn2_fc2.bias});
     auto y_half = core::wrap_tensor(ggml_scale(ctx.ggml, y.tensor, 0.5f), y.shape, GGML_TYPE_F32);
     x = core::wrap_tensor(ggml_add(ctx.ggml, x.tensor, y_half.tensor), x.shape, GGML_TYPE_F32);
 
@@ -388,9 +447,11 @@ StreamingConformerBlockOutputs StreamingConformerBlockModule::build(
     const std::optional<core::TensorValue> &) const {
     auto x = input;
     x = LayerNormModule({config_.hidden_size, config_.eps, true, true}).build(ctx, x, weights.ffn1_norm);
-    auto ff1 = LinearModule({config_.hidden_size, config_.intermediate_size, config_.use_bias}).build(ctx, x, weights.ffn1_fc1);
-    ff1 = SiluModule().build(ctx, ff1);
-    ff1 = LinearModule({config_.intermediate_size, config_.hidden_size, config_.use_bias}).build(ctx, ff1, weights.ffn1_fc2);
+    FeedForwardConfig ffn_config{config_.hidden_size, config_.intermediate_size, config_.use_bias};
+    ffn_config.activation = config_.ffn_activation;
+    const FeedForwardModule ffn(ffn_config);
+    auto ff1 = ffn.build(ctx, x, {weights.ffn1_fc1.weight, weights.ffn1_fc1.bias,
+        weights.ffn1_fc2.weight, weights.ffn1_fc2.bias});
     auto ff1_half = core::wrap_tensor(ggml_scale(ctx.ggml, ff1.tensor, 0.5f), ff1.shape, GGML_TYPE_F32);
     x = core::wrap_tensor(ggml_add(ctx.ggml, input.tensor, ff1_half.tensor), input.shape, GGML_TYPE_F32);
 
@@ -406,9 +467,8 @@ StreamingConformerBlockOutputs StreamingConformerBlockModule::build(
     x = core::wrap_tensor(ggml_add(ctx.ggml, x.tensor, conv.output.tensor), x.shape, GGML_TYPE_F32);
 
     y = LayerNormModule({config_.hidden_size, config_.eps, true, true}).build(ctx, x, weights.norm2);
-    y = LinearModule({config_.hidden_size, config_.intermediate_size, config_.use_bias}).build(ctx, y, weights.ffn2_fc1);
-    y = SiluModule().build(ctx, y);
-    y = LinearModule({config_.intermediate_size, config_.hidden_size, config_.use_bias}).build(ctx, y, weights.ffn2_fc2);
+    y = ffn.build(ctx, y, {weights.ffn2_fc1.weight, weights.ffn2_fc1.bias,
+        weights.ffn2_fc2.weight, weights.ffn2_fc2.bias});
     auto y_half = core::wrap_tensor(ggml_scale(ctx.ggml, y.tensor, 0.5f), y.shape, GGML_TYPE_F32);
     x = core::wrap_tensor(ggml_add(ctx.ggml, x.tensor, y_half.tensor), x.shape, GGML_TYPE_F32);
     x = LayerNormModule({config_.hidden_size, config_.eps, true, true}).build(ctx, x, weights.final_norm);
@@ -427,9 +487,11 @@ StreamingConformerBlockOutputs StreamingRelativeConformerBlockModule::build(
     const std::optional<core::TensorValue> & attention_mask) const {
     auto x = input;
     x = LayerNormModule({config_.hidden_size, config_.eps, true, true}).build(ctx, x, weights.ffn1_norm);
-    auto ff1 = LinearModule({config_.hidden_size, config_.intermediate_size, config_.use_bias}).build(ctx, x, weights.ffn1_fc1);
-    ff1 = SiluModule().build(ctx, ff1);
-    ff1 = LinearModule({config_.intermediate_size, config_.hidden_size, config_.use_bias}).build(ctx, ff1, weights.ffn1_fc2);
+    FeedForwardConfig ffn_config{config_.hidden_size, config_.intermediate_size, config_.use_bias};
+    ffn_config.activation = config_.ffn_activation;
+    const FeedForwardModule ffn(ffn_config);
+    auto ff1 = ffn.build(ctx, x, {weights.ffn1_fc1.weight, weights.ffn1_fc1.bias,
+        weights.ffn1_fc2.weight, weights.ffn1_fc2.bias});
     auto ff1_half = core::wrap_tensor(ggml_scale(ctx.ggml, ff1.tensor, 0.5f), ff1.shape, GGML_TYPE_F32);
     x = core::wrap_tensor(ggml_add(ctx.ggml, input.tensor, ff1_half.tensor), input.shape, GGML_TYPE_F32);
 
@@ -459,9 +521,8 @@ StreamingConformerBlockOutputs StreamingRelativeConformerBlockModule::build(
     x = core::wrap_tensor(ggml_add(ctx.ggml, x.tensor, conv.output.tensor), x.shape, GGML_TYPE_F32);
 
     y = LayerNormModule({config_.hidden_size, config_.eps, true, true}).build(ctx, x, weights.norm2);
-    y = LinearModule({config_.hidden_size, config_.intermediate_size, config_.use_bias}).build(ctx, y, weights.ffn2_fc1);
-    y = SiluModule().build(ctx, y);
-    y = LinearModule({config_.intermediate_size, config_.hidden_size, config_.use_bias}).build(ctx, y, weights.ffn2_fc2);
+    y = ffn.build(ctx, y, {weights.ffn2_fc1.weight, weights.ffn2_fc1.bias,
+        weights.ffn2_fc2.weight, weights.ffn2_fc2.bias});
     auto y_half = core::wrap_tensor(ggml_scale(ctx.ggml, y.tensor, 0.5f), y.shape, GGML_TYPE_F32);
     x = core::wrap_tensor(ggml_add(ctx.ggml, x.tensor, y_half.tensor), x.shape, GGML_TYPE_F32);
     x = LayerNormModule({config_.hidden_size, config_.eps, true, true}).build(ctx, x, weights.final_norm);

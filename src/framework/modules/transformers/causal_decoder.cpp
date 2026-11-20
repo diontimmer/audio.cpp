@@ -3,6 +3,7 @@
 #include "engine/framework/core/backend.h"
 #include "engine/framework/modules/linear_module.h"
 #include "engine/framework/modules/norm_modules.h"
+#include "engine/framework/modules/primitive_modules.h"
 #include "engine/framework/modules/structural_modules.h"
 
 #include <algorithm>
@@ -25,6 +26,12 @@ void validate_config(const CausalDecoderConfig & config) {
         config.static_cache_type != GGML_TYPE_BF16) {
         throw std::runtime_error("QwenCausalDecoderConfig static cache type must be f32, f16, or bf16");
     }
+    if (!std::isfinite(config.embedding_scale) || config.embedding_scale <= 0.0F) {
+        throw std::runtime_error("QwenCausalDecoderConfig embedding_scale must be positive and finite");
+    }
+    if (!std::isfinite(config.logit_divisor) || config.logit_divisor <= 0.0F) {
+        throw std::runtime_error("QwenCausalDecoderConfig logit_divisor must be positive and finite");
+    }
 }
 
 void validate_hidden_config(const DecoderHiddenConfig & config) {
@@ -37,6 +44,9 @@ void validate_hidden_config(const DecoderHiddenConfig & config) {
     if (config.static_cache_type != GGML_TYPE_F32 && config.static_cache_type != GGML_TYPE_F16 &&
         config.static_cache_type != GGML_TYPE_BF16) {
         throw std::runtime_error("QwenDecoderHiddenConfig static cache type must be f32, f16, or bf16");
+    }
+    if (!std::isfinite(config.embedding_scale) || config.embedding_scale <= 0.0F) {
+        throw std::runtime_error("QwenDecoderHiddenConfig embedding_scale must be positive and finite");
     }
 }
 
@@ -68,6 +78,7 @@ DecoderHiddenConfig hidden_config_from_causal(const CausalDecoderConfig & config
     DecoderHiddenConfig out;
     out.stack = config.stack;
     out.hidden_mode = config.logits_mode;
+    out.embedding_scale = config.embedding_scale;
     out.static_cache_type = config.static_cache_type;
     return out;
 }
@@ -102,8 +113,17 @@ DecoderHiddenOutputs DecoderHiddenModule::build(
     }
 
     auto stack = DecoderStackModule(config_.stack)
-                     .build(ctx, input, positions, weights.stack, prefix_state, attention_mask);
-    auto hidden_sequence = RMSNormModule({config_.stack.hidden_size, config_.stack.rms_norm_eps, true, false})
+                     .build(
+                         ctx,
+                         (config_.embedding_scale == 1.0F
+                              ? input
+                              : ScaleBiasModule({config_.embedding_scale, 0.0F}).build(ctx, input)),
+                         positions,
+                         weights.stack,
+                         prefix_state,
+                         attention_mask);
+    auto hidden_sequence = RMSNormModule({config_.stack.hidden_size, config_.stack.rms_norm_eps, true, false, false, false,
+                                         config_.stack.activation_cast.norm_intermediate_type})
                                .build(ctx, stack.output, weights.final_norm);
     auto hidden = select_hidden_steps(ctx, hidden_sequence, config_.hidden_mode);
     return {std::move(stack.output), hidden, std::move(stack.state)};
@@ -139,6 +159,9 @@ DecoderHiddenStaticCacheOutputs DecoderHiddenModule::build_static_cache_tail(
     cache_values.reserve(weights.stack.layers.size());
 
     auto x = input;
+    if (config_.embedding_scale != 1.0F) {
+        x = ScaleBiasModule({config_.embedding_scale, 0.0F}).build(ctx, x);
+    }
     const DecoderLayerModule layer_module(decoder_layer_config_from_stack(config_.stack));
     for (const auto & layer : weights.stack.layers) {
         cache_keys.push_back(core::make_tensor(
@@ -162,7 +185,8 @@ DecoderHiddenStaticCacheOutputs DecoderHiddenModule::build_static_cache_tail(
         x = out.output;
     }
 
-    auto hidden = RMSNormModule({config_.stack.hidden_size, config_.stack.rms_norm_eps, true, false})
+    auto hidden = RMSNormModule({config_.stack.hidden_size, config_.stack.rms_norm_eps, true, false, false, false,
+                                config_.stack.activation_cast.norm_intermediate_type})
                       .build(ctx, x, weights.final_norm);
     return {
         std::move(x),
@@ -184,7 +208,9 @@ DecoderHiddenBatchedStaticCacheOutputs DecoderHiddenModule::build_static_cache_t
     const DecoderHiddenWeights & weights,
     int64_t cache_steps,
     const core::TensorValue & attention_mask,
-    const core::TensorValue & cache_slot) const {
+    const core::TensorValue & cache_slot,
+    const runtime::TransformerBatchedKVCache * cache,
+    runtime::TransformerKVCacheOptions cache_options) const {
     if (graph == nullptr) {
         throw std::runtime_error("QwenDecoderHiddenModule batched static-cache build requires a graph");
     }
@@ -205,14 +231,18 @@ DecoderHiddenBatchedStaticCacheOutputs DecoderHiddenModule::build_static_cache_t
     cache_values.reserve(weights.stack.layers.size());
 
     auto x = input;
+    if (config_.embedding_scale != 1.0F) {
+        x = ScaleBiasModule({config_.embedding_scale, 0.0F}).build(ctx, x);
+    }
     const DecoderLayerModule layer_module(decoder_layer_config_from_stack(config_.stack));
     for (const auto & layer : weights.stack.layers) {
-        cache_keys.push_back(core::make_tensor(
+        const size_t index = cache_keys.size();
+        cache_keys.push_back(cache ? cache->key_tensor(index) : core::make_tensor(
             ctx,
             config_.static_cache_type,
             core::TensorShape::from_dims(
                 {batch_size, cache_steps, config_.stack.num_key_value_heads, config_.stack.head_dim})));
-        cache_values.push_back(core::make_tensor(
+        cache_values.push_back(cache ? cache->value_tensor(index) : core::make_tensor(
             ctx,
             config_.static_cache_type,
             core::TensorShape::from_dims(
@@ -230,8 +260,11 @@ DecoderHiddenBatchedStaticCacheOutputs DecoderHiddenModule::build_static_cache_t
         x = out.output;
     }
 
-    auto hidden = RMSNormModule({config_.stack.hidden_size, config_.stack.rms_norm_eps, true, false})
+    auto hidden = RMSNormModule({config_.stack.hidden_size, config_.stack.rms_norm_eps, true, false, false, false,
+                                config_.stack.activation_cast.norm_intermediate_type})
                       .build(ctx, x, weights.final_norm);
+    cache_options.allow_f16_storage = config_.static_cache_type == GGML_TYPE_F16;
+    cache_options.allow_bf16_storage = config_.static_cache_type == GGML_TYPE_BF16;
     return {
         std::move(x),
         hidden,
@@ -241,7 +274,7 @@ DecoderHiddenBatchedStaticCacheOutputs DecoderHiddenModule::build_static_cache_t
             row_elems,
             std::move(cache_keys),
             std::move(cache_values),
-            transformer_cache_options(config_.static_cache_type)),
+            cache_options),
     };
 }
 
@@ -281,13 +314,16 @@ CausalDecoderOutputs CausalDecoderModule::build(
             logits_input.shape,
             *config_.lm_head_input_type);
     }
-    const auto logits = LinearModule({
+    auto logits = LinearModule({
                             config_.stack.hidden_size,
                             config_.logits_size,
                             config_.use_lm_head_bias,
                             config_.lm_head_precision,
                         })
                             .build(ctx, logits_input, weights.lm_head);
+    if (config_.logit_divisor != 1.0F) {
+        logits = ScaleBiasModule({1.0F / config_.logit_divisor, 0.0F}).build(ctx, logits);
+    }
     return {std::move(hidden_out.sequence), hidden_out.hidden, logits, std::move(hidden_out.state)};
 }
 
@@ -328,13 +364,16 @@ CausalDecoderStaticCacheOutputs CausalDecoderModule::build_static_cache_tail(
             logits_input.shape,
             *config_.lm_head_input_type);
     }
-    const auto logits = LinearModule({
+    auto logits = LinearModule({
                             config_.stack.hidden_size,
                             config_.logits_size,
                             config_.use_lm_head_bias,
                             config_.lm_head_precision,
                         })
                             .build(ctx, logits_input, weights.lm_head);
+    if (config_.logit_divisor != 1.0F) {
+        logits = ScaleBiasModule({1.0F / config_.logit_divisor, 0.0F}).build(ctx, logits);
+    }
     return {
         std::move(hidden_out.sequence),
         hidden_out.hidden,
@@ -351,7 +390,9 @@ CausalDecoderBatchedStaticCacheOutputs CausalDecoderModule::build_static_cache_t
     const CausalDecoderWeights & weights,
     int64_t cache_steps,
     const core::TensorValue & attention_mask,
-    const core::TensorValue & cache_slot) const {
+    const core::TensorValue & cache_slot,
+    const runtime::TransformerBatchedKVCache * cache,
+    runtime::TransformerKVCacheOptions cache_options) const {
     if (graph == nullptr) {
         throw std::runtime_error("QwenCausalDecoderModule batched static-cache build requires a graph");
     }
@@ -370,7 +411,9 @@ CausalDecoderBatchedStaticCacheOutputs CausalDecoderModule::build_static_cache_t
                               hidden_weights_from_causal(weights),
                               cache_steps,
                               attention_mask,
-                              cache_slot);
+                              cache_slot,
+                              cache,
+                              cache_options);
     auto logits_input = hidden_out.hidden;
     if (config_.lm_head_input_type.has_value() && logits_input.type != *config_.lm_head_input_type) {
         logits_input = core::wrap_tensor(
@@ -378,13 +421,16 @@ CausalDecoderBatchedStaticCacheOutputs CausalDecoderModule::build_static_cache_t
             logits_input.shape,
             *config_.lm_head_input_type);
     }
-    const auto logits = LinearModule({
+    auto logits = LinearModule({
                             config_.stack.hidden_size,
                             config_.logits_size,
                             config_.use_lm_head_bias,
                             config_.lm_head_precision,
                         })
                             .build(ctx, logits_input, weights.lm_head);
+    if (config_.logit_divisor != 1.0F) {
+        logits = ScaleBiasModule({1.0F / config_.logit_divisor, 0.0F}).build(ctx, logits);
+    }
     return {
         std::move(hidden_out.sequence),
         hidden_out.hidden,

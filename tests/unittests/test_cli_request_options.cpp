@@ -1,15 +1,25 @@
 #include "../../app/cli/args.h"
 #include "../../app/cli/request.h"
+#include "../../app/common/base64.h"
 
 #include "engine/framework/io/json.h"
+#include "engine/framework/runtime/errors.h"
 #include "engine/framework/runtime/options.h"
 
 #include "test_assert.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -32,7 +42,7 @@ uint64_t parse_seed(const std::string & value) {
 void require_seed_rejected(const std::string & value) {
     try {
         (void) parse_seed(value);
-    } catch (const std::runtime_error &) {
+    } catch (const engine::runtime::InvalidRequestError &) {
         return;
     }
     throw std::runtime_error("unsafe seed option was parsed unexpectedly: " + value);
@@ -70,12 +80,154 @@ void test_unsafe_integer_numbers_are_not_silently_rounded() {
     require_seed_rejected(rounded);
 }
 
+void test_malformed_seeds_are_invalid_requests() {
+    // A JSON null option reaches the parser as "null".
+    for (const char * value : {"null", " -1", "18446744073709551616"}) {
+        require_seed_rejected(value);
+    }
+}
+
 void test_audio_only_language_is_request_option() {
     const char * argv[] = {"audiocpp_cli", "--task", "asr", "--family", "qwen3_asr", "--language", "en"};
     const auto request = minitts::cli::build_request_from_cli(7, const_cast<char **>(argv));
 
     engine::test::require(!request.text_input.has_value(), "audio-only language does not synthesize text input");
     engine::test::require_eq(request.options.at("language"), std::string("en"), "audio-only language request option");
+}
+
+void test_audio_chunk_shortcut_uses_canonical_name() {
+    const char * argv[] = {"audiocpp_cli", "--audio-chunk-seconds", "5"};
+    const auto request = minitts::cli::build_request_from_cli(3, const_cast<char **>(argv));
+    engine::test::require_eq(request.options.at("audio_chunk_duration_sec"), std::string("5"),
+                            "audio chunk shortcut uses canonical option");
+    engine::test::require(request.options.count("audio_chunk_seconds") == 0,
+                          "audio chunk shortcut does not emit legacy key");
+
+    const char * legacy_argv[] = {"audiocpp_cli", "--request-option", "audio_chunk_seconds=5"};
+    const auto legacy = minitts::cli::build_request_from_cli(3, const_cast<char **>(legacy_argv));
+    engine::test::require_eq(legacy.options.at("audio_chunk_seconds"), std::string("5"),
+                            "explicit legacy options remain available to model compatibility handling");
+}
+
+void test_normalized_request_option_aliases() {
+    using engine::runtime::find_option;
+    using engine::test::require;
+    using engine::test::require_eq;
+    const std::vector<std::pair<std::string, std::string>> aliases = {
+        {"instruction", "instruct"},
+        {"speed", "speaking_rate"},
+        {"max_tokens", "max_new_tokens"},
+        {"max_tokens", "max_text_tokens"},
+        {"num_beams", "beam_size"},
+        {"duration_frames", "tokens"},
+        {"text_temperature", "moss_tts_v15.text_temperature"},
+        {"text_temperature", "moss_ttsd.text_temperature"},
+        {"text_temperature", "moss_voicegen.text_temperature"},
+        {"duration_scale", "duration_factor"},
+        {"duration_scale", "length_adjust"},
+        {"reference_duration_sec", "max_ref_sec"},
+        {"max_speech_duration_sec", "max_speech_duration_s"},
+        {"mem_saver", "memory_saver"},
+        {"punc", "pnc"},
+        {"punc", "punctuation"},
+        {"punc", "punctuated"},
+        {"sampler_mode", "sampler"},
+        {"flow_guidance_scale", "s3gen_cfg_rate"},
+        {"max_frames", "max_steps"},
+        {"text_chunk_tokens", "max_tokens"},
+        {"max_duration_sec", "max_seconds"},
+        {"min_duration_sec", "min_seconds"},
+        {"reference_duration_sec", "ref_seconds"},
+        {"duration_sec", "target_duration_seconds"},
+        {"reference_duration_sec", "reference_duration_seconds"},
+        {"max_audio_steps", "max_new_audio_steps"},
+        {"min_audio_steps", "min_new_audio_steps"},
+        {"max_text_tokens", "max_new_text_tokens"},
+        {"audio_chunk_duration_sec", "audio_chunk_seconds"},
+        {"lfm2_audio.max_pass_duration_sec", "lfm2_audio.max_pass_seconds"},
+        {"video_file", "video"},
+        {"vieneu_v3_turbo.g2p_dict_file", "vieneu_v3_turbo.g2p_dict"},
+        {"vieneu_v3_turbo.g2p_dict_file", "g2p_dict"},
+        {"language", "lang"},
+        {"shift", "t_shift"},
+        {"zipvoice.shift", "zipvoice.t_shift"},
+        {"auto_frame_cap", "frame_cap"},
+        {"text_chunk_min_size", "text_chunk_min"},
+        {"voice_id", "speaker"},
+        {"duration_sec", "duration_seconds"},
+        {"lm_guidance_scale", "lm_cfg_scale"},
+        {"enable_thinking", "thinking"},
+        {"gigaam_asr.vad_model_path", "vad_model_path"},
+        {"qwen3_asr.vad_model_path", "qwen3_asr.vad_path"},
+        {"noise_file", "noise_path"},
+        {"flow_noise_file", "flow_noise_path"},
+        {"hift_source_random_file", "hift_source_random_path"},
+        {"speaker_embedding_file", "speaker_embedding_path"},
+        {"voice_embedding_file", "voice_embedding_path"},
+        {"voice_embedding_file", "pocket_tts.voice_embedding_path"},
+        {"export_voice_state_file", "export_voice_state_path"},
+        {"export_voice_state_file", "pocket_tts.export_voice_state_path"},
+        {"pitch_file", "pitch_path"},
+        {"retrieval_index_file", "retrieval_index_path"},
+        {"reference_image_file", "reference_image_path"},
+        {"reference_image_file", "ref_image"},
+        {"reference_video_file", "reference_video_path"},
+        {"outetts.forced_aligner_path", "outetts.aligner_path"},
+        {"kokoro_tts.predictor_duration_graph_arena_mb", "kokoro_tts.predictor_duration_graph_mb"},
+        {"kokoro_tts.predictor_text_graph_arena_mb", "kokoro_tts.predictor_text_graph_mb"},
+        {"kokoro_tts.predictor_tail_graph_arena_mb", "kokoro_tts.predictor_tail_graph_mb"},
+        {"minimax_music3.graph_arena_mb", "minimax_music3.graph_context_mb"},
+        {"pocket_tts.flow_step_graph_arena_mb", "pocket_tts.flow_step_graph_context_mb"},
+        {"pocket_tts.mimi_encoder_graph_arena_mb", "pocket_tts.mimi_encoder_graph_context_mb"},
+        {"pocket_tts.mimi_conv_graph_arena_mb", "pocket_tts.mimi_conv_graph_context_mb"},
+        {"pocket_tts.mimi_transformer_graph_arena_mb", "pocket_tts.mimi_transformer_graph_context_mb"},
+        {"pocket_tts.mimi_tail_graph_arena_mb", "pocket_tts.mimi_tail_graph_context_mb"},
+        {"vevo2.ar_prefill_graph_arena_mb", "vevo2.ar_prefill_graph_context_mb"},
+        {"vevo2.ar_decode_graph_arena_mb", "vevo2.ar_decode_graph_context_mb"},
+        {"vevo2.tokenizer_graph_arena_mb", "vevo2.tokenizer_graph_context_mb"},
+        {"vevo2.whisper_graph_arena_mb", "vevo2.whisper_graph_context_mb"},
+        {"vevo2.fm_graph_arena_mb", "vevo2.fm_graph_context_mb"},
+        {"vevo2.vocoder_graph_arena_mb", "vevo2.vocoder_graph_context_mb"},
+        {"voxcpm1.text_embedding_graph_arena_mb", "voxcpm1.text_embedding_graph_context_mb"},
+        {"voxcpm1.lm_step_graph_arena_mb", "voxcpm1.lm_step_graph_context_mb"},
+        {"voxcpm1.projection_graph_arena_mb", "voxcpm1.projection_graph_context_mb"},
+        {"voxcpm1.local_encoder_graph_arena_mb", "voxcpm1.local_encoder_graph_context_mb"},
+        {"voxcpm1.dit_graph_arena_mb", "voxcpm1.dit_graph_context_mb"},
+        {"voxcpm1.audiovae_graph_arena_mb", "voxcpm1.audiovae_graph_context_mb"},
+        {"voxcpm1.audiovae_encoder_graph_arena_mb", "voxcpm1.audiovae_encoder_graph_context_mb"},
+        {"voxcpm2.text_embedding_graph_arena_mb", "voxcpm2.text_embedding_graph_context_mb"},
+        {"voxcpm2.lm_step_graph_arena_mb", "voxcpm2.lm_step_graph_context_mb"},
+        {"voxcpm2.projection_graph_arena_mb", "voxcpm2.projection_graph_context_mb"},
+        {"voxcpm2.local_encoder_graph_arena_mb", "voxcpm2.local_encoder_graph_context_mb"},
+        {"voxcpm2.dit_graph_arena_mb", "voxcpm2.dit_graph_context_mb"},
+        {"voxcpm2.audiovae_graph_arena_mb", "voxcpm2.audiovae_graph_context_mb"},
+        {"voxcpm2.audiovae_encoder_graph_arena_mb", "voxcpm2.audiovae_encoder_graph_context_mb"},
+    };
+    for (const auto & [canonical, legacy] : aliases) {
+        require(!find_option({}, {canonical, legacy}), "absent aliases retain model defaults");
+        for (const auto & key : {canonical, legacy}) {
+            const std::string option = key + "=2";
+            const char * argv[] = {"audiocpp_cli", "--task", "tts", "--request-option", option.c_str()};
+            const auto request = minitts::cli::build_request_from_cli(5, const_cast<char **>(argv));
+            const auto parsed = find_option(request.options, {canonical, legacy});
+            require(parsed.has_value(), "CLI preserves option " + key);
+            require_eq(*parsed, std::string("2"), "alias value " + key);
+        }
+        const std::unordered_map<std::string, std::string> matching{{canonical, "2"}, {legacy, "2"}};
+        require_eq(*find_option(matching, {canonical, legacy}), std::string("2"), "matching aliases");
+        bool rejected = false;
+        try {
+            (void)find_option({{canonical, "2"}, {legacy, "3"}}, {canonical, legacy});
+        } catch (const std::runtime_error & error) {
+            rejected = std::string(error.what()).find("conflicting option values") != std::string::npos;
+        }
+        require(rejected, "conflicting aliases rejected: " + canonical + "/" + legacy);
+    }
+    // This same-value speed alias is for Inflect, not sanoTTS's reciprocal control.
+    require_eq(*engine::runtime::parse_finite_float_option({{"speaking_rate", "1.5"}},
+                   {"speed", "speaking_rate"}), 1.5F, "legacy Inflect speed");
+    require_eq(*engine::runtime::parse_finite_float_option({{"speed", "1.5"}},
+                   {"speed", "speaking_rate"}), 1.5F, "normalized Inflect speed");
 }
 
 void test_out_format_selects_wav_sample_format() {
@@ -105,14 +257,594 @@ void test_out_format_selects_wav_sample_format() {
     throw std::runtime_error("unknown --out-format value was accepted");
 }
 
+engine::runtime::TaskRequest request_with_artifacts(
+    const std::string & artifacts,
+    const std::filesystem::path & base_dir) {
+    return minitts::cli::build_request_from_json(
+        engine::io::json::parse("{\"text\":\"hi\",\"artifacts\":" + artifacts + "}"), base_dir);
+}
+
+void require_artifacts_rejected(
+    const std::string & artifacts,
+    const std::filesystem::path & base_dir,
+    const std::string & message) {
+    try {
+        (void) request_with_artifacts(artifacts, base_dir);
+    } catch (const engine::runtime::InvalidRequestError & error) {
+        engine::test::require(
+            std::string(error.what()).find(message) != std::string::npos,
+            "artifacts " + artifacts + " failed with '" + error.what() + "', expected '" + message + "'");
+        return;
+    }
+    throw std::runtime_error("artifacts were accepted: " + artifacts);
+}
+
+std::string artifact_text(const engine::runtime::VoiceArtifact & artifact) {
+    std::string text;
+    for (const std::byte byte : artifact.payload) {
+        text.push_back(static_cast<char>(byte));
+    }
+    return text;
+}
+
+void test_request_json_artifacts() {
+    static_assert(std::is_base_of_v<std::runtime_error, engine::runtime::InvalidRequestError>,
+                  "the CLI reports artifact errors like any other bad input");
+    const auto dir = std::filesystem::temp_directory_path() /
+        ("audiocpp-request-artifacts-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    struct RemoveDir {
+        std::filesystem::path path;
+        ~RemoveDir() {
+            std::error_code ignored;
+            std::filesystem::remove_all(path, ignored);
+        }
+    } remove_dir{dir};
+    std::filesystem::create_directories(dir / "turns");
+    std::ofstream(dir / "turns" / "reply.bin", std::ios::binary) << std::string("\x01\x00\xff\x7f", 4);
+    std::ofstream(dir / "empty.bin", std::ios::binary).close();
+
+    // Inline and file payloads, in order, ids repeated, meta values as strings.
+    const auto request = request_with_artifacts(
+        "[{\"id\":\"turn.question\",\"kind\":\"custom\",\"payload\":\"aGVsbG8=\","
+        "\"meta\":{\"mime\":\"audio/wav\",\"steps\":12,\"ended\":true}},"
+        "{\"id\":\"turn.reply\",\"kind\":\"acoustic_tokens\",\"path\":\"turns/reply.bin\"},"
+        "{\"id\":\"turn.question\",\"kind\":\"custom\",\"payload\":\"data:audio/wav;base64,d29y\\nbGQ=\",\"meta\":null},"
+        "{\"id\":\"empty\",\"kind\":\"midi\",\"path\":" +
+            engine::io::json::stringify_string((dir / "empty.bin").string()) + "},"
+        "{\"id\":\"none\",\"kind\":\"vad_state\",\"payload\":\"\",\"path\":null}]",
+        dir);
+    const auto & artifacts = request.input_artifacts;
+    engine::test::require_eq(artifacts.size(), size_t{5}, "request artifact count");
+    engine::test::require(
+        artifacts[0].id == "turn.question" && artifacts[0].kind == engine::runtime::ArtifactKind::Custom &&
+            artifact_text(artifacts[0]) == "hello",
+        "inline artifact");
+    engine::test::require(
+        artifacts[0].meta.size() == 3 && artifacts[0].meta.at("mime") == "audio/wav" &&
+            artifacts[0].meta.at("steps") == "12" && artifacts[0].meta.at("ended") == "true",
+        "artifact meta values");
+    engine::test::require(
+        artifacts[1].id == "turn.reply" && artifacts[1].kind == engine::runtime::ArtifactKind::AcousticTokens &&
+            artifact_text(artifacts[1]) == std::string("\x01\x00\xff\x7f", 4) && artifacts[1].meta.empty(),
+        "file artifact, path relative to the request file");
+    engine::test::require(
+        artifacts[2].id == "turn.question" && artifact_text(artifacts[2]) == "world" && artifacts[2].meta.empty(),
+        "data URI artifact with a line break");
+    engine::test::require(
+        artifacts[3].kind == engine::runtime::ArtifactKind::Midi && artifacts[3].payload.empty() &&
+            artifacts[4].kind == engine::runtime::ArtifactKind::VadState && artifacts[4].payload.empty(),
+        "empty payloads");
+
+    // The kind names the server writes in responses.
+    const std::vector<std::pair<std::string, engine::runtime::ArtifactKind>> kinds{
+        {"speaker_embedding", engine::runtime::ArtifactKind::SpeakerEmbedding},
+        {"style_embedding", engine::runtime::ArtifactKind::StyleEmbedding},
+        {"prompt_embedding", engine::runtime::ArtifactKind::PromptEmbedding},
+        {"acoustic_tokens", engine::runtime::ArtifactKind::AcousticTokens},
+        {"midi", engine::runtime::ArtifactKind::Midi},
+        {"transcript_alignment", engine::runtime::ArtifactKind::TranscriptAlignment},
+        {"diarization_state", engine::runtime::ArtifactKind::DiarizationState},
+        {"vad_state", engine::runtime::ArtifactKind::VadState},
+        {"custom", engine::runtime::ArtifactKind::Custom},
+    };
+    for (const auto & [name, kind] : kinds) {
+        const auto parsed = request_with_artifacts("[{\"id\":\"k\",\"kind\":\"" + name + "\",\"payload\":\"\"}]", dir);
+        engine::test::require(parsed.input_artifacts.front().kind == kind, "artifact kind " + name);
+    }
+    engine::test::require(request_with_artifacts("null", dir).input_artifacts.empty(), "null artifacts");
+    engine::test::require(
+        minitts::cli::build_request_from_json(engine::io::json::parse("{\"text\":\"hi\"}"), dir).input_artifacts.empty(),
+        "no artifacts field");
+
+    require_artifacts_rejected("{}", dir, "artifacts must be an array of artifact objects");
+    require_artifacts_rejected("[1]", dir, "artifacts[0] must be an object with id, kind, and payload or path");
+    require_artifacts_rejected("[{\"kind\":\"custom\",\"payload\":\"\"}]", dir, "artifacts[0]: id must be a non-empty string");
+    require_artifacts_rejected("[{\"id\":\"\",\"kind\":\"custom\",\"payload\":\"\"}]", dir, "artifacts[0]: id must be a non-empty string");
+    require_artifacts_rejected("[{\"id\":7,\"kind\":\"custom\",\"payload\":\"\"}]", dir, "artifacts[0]: id must be a non-empty string");
+    require_artifacts_rejected("[{\"id\":\"x\",\"payload\":\"\"}]", dir, "artifacts[0] (x): kind must be a string");
+    require_artifacts_rejected(
+        "[{\"id\":\"ok\",\"kind\":\"custom\",\"payload\":\"\"},{\"id\":\"x\",\"kind\":\"tokens\",\"payload\":\"\"}]", dir,
+        "artifacts[1] (x): unknown kind 'tokens', expected one of speaker_embedding, style_embedding,");
+    require_artifacts_rejected("[{\"id\":\"x\",\"kind\":\"custom\"}]", dir, "artifacts[0] (x): give exactly one of payload");
+    require_artifacts_rejected(
+        "[{\"id\":\"x\",\"kind\":\"custom\",\"payload\":\"\",\"path\":\"turns/reply.bin\"}]", dir,
+        "artifacts[0] (x): give exactly one of payload");
+    require_artifacts_rejected("[{\"id\":\"x\",\"kind\":\"custom\",\"payload\":5}]", dir, "artifacts[0] (x): payload must be a base64 string");
+    require_artifacts_rejected(
+        "[{\"id\":\"x\",\"kind\":\"custom\",\"payload\":\"aGVsbG8*\"}]", dir,
+        "artifacts[0] (x): payload is not valid base64 (malformed base64 payload: invalid character)");
+    require_artifacts_rejected("[{\"id\":\"x\",\"kind\":\"custom\",\"path\":\"\"}]", dir, "artifacts[0] (x): path must be a non-empty string");
+    require_artifacts_rejected("[{\"id\":\"x\",\"kind\":\"custom\",\"path\":\"missing.bin\"}]", dir, "artifacts[0] (x): path is not a regular file");
+    require_artifacts_rejected("[{\"id\":\"x\",\"kind\":\"custom\",\"path\":\"turns\"}]", dir, "artifacts[0] (x): path is not a regular file");
+    require_artifacts_rejected("[{\"id\":\"x\",\"kind\":\"custom\",\"payload\":\"\",\"meta\":[]}]", dir, "artifacts[0] (x): meta must be an object");
+    require_artifacts_rejected(
+        "[{\"id\":\"x\",\"kind\":\"custom\",\"payload\":\"\",\"meta\":{\"k\":{}}}]", dir,
+        "artifacts[0] (x): meta.k must be a string, number or boolean");
+    require_artifacts_rejected(
+        "[{\"id\":\"x\",\"kind\":\"custom\",\"payload_hex\":\"00\"}]", dir,
+        "artifacts[0]: unknown field 'payload_hex', an artifact has id, kind, payload or path, and meta");
+
+#if !defined(_WIN32)
+    // The payload limit counts every artifact of the request. The file is
+    // sparse and too big to be read, so nothing near the limit is written.
+    std::ofstream(dir / "limit.bin", std::ios::binary).close();
+    std::filesystem::resize_file(dir / "limit.bin", minitts::cli::kMaxRequestArtifactBytes - 4);
+    require_artifacts_rejected(
+        "[{\"id\":\"x\",\"kind\":\"custom\",\"payload\":\"aGVsbG8=\"},"
+        "{\"id\":\"y\",\"kind\":\"custom\",\"path\":\"limit.bin\"}]",
+        dir, "artifacts[1] (y): the request's artifact payloads total more than 2147483648 bytes");
+#endif
+}
+
+void test_component_exec_plans() {
+    using engine::core::BackendType;
+    using engine::runtime::parse_exec_plan;
+    const auto parse = [](const std::unordered_map<std::string, std::string> & options) {
+        return parse_exec_plan(
+            options, "toy.exec_plan",
+            {{"decoder", "ggml",
+              {{"ggml", {BackendType::Cpu}, {}, {}},
+               {"native", {BackendType::Cpu}, {}, {}},
+               {"compiled", {}, {"main"}, {"first"}, {"overlap", "gain", "future"}}}},
+             {"encoder", "ggml", {{"ggml", {BackendType::Cpu}, {}, {}}}}});
+    };
+    const auto defaults = parse({});
+    const auto & default_plan = defaults.at("decoder");
+    engine::test::require_eq(default_plan.impl, std::string("ggml"), "missing plan preserves default");
+    engine::test::require(!default_plan.backend && default_plan.artifacts.empty() && default_plan.params.empty(),
+                          "missing plan has no overrides");
+    engine::test::require_eq(defaults.at("encoder").impl, std::string("ggml"), "all components receive defaults");
+    for (const auto & value : {"{}", "{\"decoder\":{}}", "{\"decoder\":{\"impl\":\"default\"}}"}) {
+        const auto plans = parse({{"toy.exec_plan", value}});
+        engine::test::require(plans.at("decoder").impl == "ggml" && plans.at("encoder").impl == "ggml",
+                              "empty, omitted and explicit default components preserve defaults");
+    }
+    const auto plans = parse({{"toy.exec_plan", R"({"decoder":{"impl":"native","backend":"cpu"}})"}});
+    const auto & native = plans.at("decoder");
+    engine::test::require(native.backend == BackendType::Cpu && native.impl == "native", "native CPU selection");
+    engine::test::require_eq(plans.at("encoder").impl, std::string("ggml"), "selecting decoder leaves encoder unchanged");
+    const auto body = engine::io::json::parse(R"({"toy.exec_plan":{
+        "encoder":{"backend":"cpu"},
+        "decoder":{"impl":"compiled","artifacts":{"main":"main.bin","first":"first.bin"},
+                   "params":{"overlap":4,"gain":true,"future":{"nested":[1,2]}}}
+    }})");
+    const auto combined = parse(minitts::cli::json_options_map(&body));
+    const auto & compiled = combined.at("decoder");
+    engine::test::require(compiled.impl == "compiled" && compiled.artifacts.at("main") == "main.bin" &&
+                          compiled.artifacts.at("first") == "first.bin", "named compiled artifacts");
+    engine::test::require(compiled.params.at("overlap").as_i64() == 4 && compiled.params.at("gain").as_bool() &&
+                          compiled.params.at("future").require("nested").as_array().size() == 2,
+                          "parameters retain JSON types and support model-local structured settings");
+    engine::test::require(combined.at("encoder").backend == BackendType::Cpu,
+                          "multiple component settings are resolved independently");
+    const std::vector<std::pair<std::string, std::string>> rejected = {
+        {"", "toy.exec_plan"},
+        {"[]", "must be a JSON object"},
+        {R"({"unknown":{}})", "unsupported component 'unknown'"},
+        {R"({"impl":"native"})", "unsupported component 'impl'"},
+        {R"({"decoder":null})", "toy.exec_plan.decoder must be a JSON object"},
+        {R"({"decoder":{"impl":false}})", ".impl must be a nonempty string"},
+        {R"({"decoder":{"impl":""}})", ".impl must be a nonempty string"},
+        {R"({"decoder":{"impl":"missing"}})", "unsupported impl"},
+        {R"({"decoder":{"implementation":"native"}})", "unknown field"},
+        {R"({"decoder":{"backend":1}})", ".backend must be a string"},
+        {R"({"decoder":{"backend":"missing"}})", "unknown backend"},
+        {R"({"decoder":{"backend":"cuda"}})", "requested backend is not supported"},
+        {R"({"decoder":{"impl":"compiled"}})", "requires artifacts.main"},
+        {R"({"decoder":{"impl":"compiled","artifacts":{"first":"first.bin"}}})", "requires artifacts.main"},
+        {R"({"decoder":{"impl":"compiled","backend":"cpu","artifacts":{"main":"main.bin"}}})", "requested backend is not supported"},
+        {R"({"decoder":{"artifacts":[]}})", ".artifacts must be an object"},
+        {R"({"decoder":{"artifacts":{"main":0}}})", "must be a nonempty file path"},
+        {R"({"decoder":{"artifacts":{"main":""}}})", "must be a nonempty file path"},
+        {R"({"decoder":{"artifacts":{"main":"main.bin"}}})", "unsupported artifact role"},
+        {R"({"decoder":{"impl":"compiled","artifacts":{"main":"main.bin","other":"other.bin"}}})", "unsupported artifact role"},
+        {R"({"decoder":{"params":[]}})", ".params must be an object"},
+        {R"({"decoder":{"params":{"overlap":4}}})", "unsupported parameter"},
+        {R"({"decoder":{"impl":"compiled","artifacts":{"main":"main.bin"},"params":{"unknown":true}}})", "unsupported parameter"},
+    };
+    for (const auto & [value, expected] : rejected) {
+        bool rejected = false;
+        try {
+            (void) parse({{"toy.exec_plan", value}});
+        } catch (const std::runtime_error & error) {
+            rejected = true;
+            engine::test::require(std::string(error.what()).find(expected) != std::string::npos,
+                                  "exec plan error identifies invalid field: " + value);
+        }
+        engine::test::require(rejected, "invalid exec plan must not be ignored: " + value);
+    }
+}
+
+void test_non_negative_int_flag_values() {
+    using minitts::cli::parse_non_negative_int;
+    const std::string flag = "--resample-kernel-cache-mb";
+    engine::test::require_eq(parse_non_negative_int("0", flag), 0, "0 parses");
+    engine::test::require_eq(parse_non_negative_int("32", flag), 32, "32 parses");
+    engine::test::require_eq(parse_non_negative_int("2147483647", flag), 2147483647, "INT_MAX parses");
+    for (const std::string value : {"-1", "abc", "32abc", "1.5", "", " 8", "+5", "2147483648"}) {
+        bool rejected = false;
+        try {
+            (void) parse_non_negative_int(value, flag);
+        } catch (const std::runtime_error & error) {
+            rejected = std::string(error.what()) == flag + " expects a non-negative integer, got: " + value;
+        }
+        engine::test::require(rejected, flag + " rejects '" + value + "' and names the flag");
+    }
+}
+
+// A 16-bit mono WAV of these samples, as a caller would send it.
+std::string wav_bytes(const std::vector<int16_t> & samples, uint32_t sample_rate) {
+    std::string wav;
+    const auto put = [&wav](uint32_t value, int bytes) {
+        for (int i = 0; i < bytes; ++i) {
+            wav.push_back(static_cast<char>((value >> (8 * i)) & 0xFF));
+        }
+    };
+    const auto data_bytes = static_cast<uint32_t>(samples.size() * sizeof(int16_t));
+    wav += "RIFF";
+    put(36 + data_bytes, 4);
+    wav += "WAVEfmt ";
+    put(16, 4);
+    put(1, 2);
+    put(1, 2);
+    put(sample_rate, 4);
+    put(sample_rate * 2, 4);
+    put(2, 2);
+    put(16, 2);
+    wav += "data";
+    put(data_bytes, 4);
+    for (const int16_t sample : samples) {
+        put(static_cast<uint16_t>(sample), 2);
+    }
+    return wav;
+}
+
+engine::runtime::TaskRequest request_with_voice_ref(const std::string & voice_ref, const std::filesystem::path & base_dir) {
+    return minitts::cli::build_request_from_json(
+        engine::io::json::parse("{\"text\":\"hi\",\"voice_ref\":" + voice_ref + "}"), base_dir);
+}
+
+void require_voice_ref_rejected(const std::string & voice_ref, const std::string & message) {
+    try {
+        (void) request_with_voice_ref(voice_ref, std::filesystem::temp_directory_path());
+    } catch (const engine::runtime::InvalidRequestError & error) {
+        engine::test::require(
+            std::string(error.what()).find(message) != std::string::npos,
+            "voice_ref " + voice_ref.substr(0, 60) + " failed with '" + error.what() + "', expected '" + message + "'");
+        return;
+    }
+    throw std::runtime_error("voice_ref was accepted: " + voice_ref.substr(0, 60));
+}
+
+void test_request_json_voice_ref() {
+    const auto dir = std::filesystem::temp_directory_path() /
+        ("audiocpp-request-voice-ref-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    struct RemoveDir {
+        std::filesystem::path path;
+        ~RemoveDir() {
+            std::error_code ignored;
+            std::filesystem::remove_all(path, ignored);
+        }
+    } remove_dir{dir};
+    std::filesystem::create_directories(dir / "voices");
+    const std::string wav = wav_bytes({0, 16384, -16384, 32767}, 16000);
+    std::ofstream(dir / "voices" / "ref.wav", std::ios::binary) << wav;
+
+    const auto require_voice = [](const engine::runtime::TaskRequest & request, const std::string & label) {
+        engine::test::require(
+            request.voice.has_value() && request.voice->speaker.has_value() && request.voice->speaker->audio.has_value(),
+            label + " sets the speaker audio");
+        const auto & audio = *request.voice->speaker->audio;
+        engine::test::require_eq(audio.sample_rate, 16000, label + " sample rate");
+        engine::test::require_eq(audio.samples.size(), size_t{4}, label + " sample count");
+        engine::test::require(audio.samples[1] > 0.49F && audio.samples[1] < 0.51F, label + " sample value");
+    };
+
+    // A path string, a path object and an inline WAV give the same voice;
+    // paths are relative to the request file.
+    require_voice(request_with_voice_ref("\"voices/ref.wav\"", dir), "path string");
+    require_voice(request_with_voice_ref("{\"type\":\"path\",\"path\":\"voices/ref.wav\"}", dir), "path object");
+    const std::vector<uint8_t> wav_data(wav.begin(), wav.end());
+    require_voice(
+        request_with_voice_ref("{\"type\":\"base64\",\"data\":\"" + minitts::app::base64_encode(wav_data) + "\"}", dir),
+        "inline base64");
+    require_voice(
+        request_with_voice_ref(
+            "{\"type\":\"base64\",\"data\":\"data:audio/wav;base64," + minitts::app::base64_encode(wav_data) + "\"}", dir),
+        "inline data URI");
+    engine::test::require(!request_with_voice_ref("null", dir).voice.has_value(), "null voice_ref");
+
+    require_voice_ref_rejected("42", "voice_ref must be a path string or an object");
+    require_voice_ref_rejected("{\"type\":\"url\",\"data\":\"x\"}", "voice_ref type must be");
+    require_voice_ref_rejected("{\"data\":\"UklGRg==\"}", "voice_ref type must be");
+    require_voice_ref_rejected("{\"type\":\"path\"}", "needs a path string");
+    require_voice_ref_rejected("{\"type\":\"base64\"}", "needs a data string");
+    require_voice_ref_rejected("{\"type\":\"base64\",\"data\":\"@@@@\"}", "not valid base64");
+    require_voice_ref_rejected("{\"type\":\"base64\",\"data\":\"\"}", "empty payload");
+    const std::string not_wav = "plain text, not a WAV file";
+    require_voice_ref_rejected(
+        "{\"type\":\"base64\",\"data\":\"" +
+            minitts::app::base64_encode(std::vector<uint8_t>(not_wav.begin(), not_wav.end())) + "\"}",
+        "not a readable WAV");
+    require_voice_ref_rejected(
+        "{\"type\":\"base64\",\"data\":\"" + std::string(size_t{8} * 1024 * 1024, 'A') + "\"}", "5 MiB limit");
+}
+
+void test_cli_arguments_can_be_loaded_from_yaml() {
+    const auto config_path = std::filesystem::temp_directory_path() /
+                             ("audiocpp-cli-config-" +
+                              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+                              ".yaml");
+    {
+        std::ofstream config(config_path);
+        config << "task: tts\n"
+               << "model: model.gguf\n"
+               << "text: configured text\n"
+               << "metrics: true\n"
+               << "inspect: false\n"
+               << "do-sample: false\n"
+               << "request-option:\n"
+               << "  - temperature=0.7\n"
+               << "  - top_k=10\n";
+    }
+
+    const std::string config_argument = config_path.string();
+    const char * argv[] = {
+        "audiocpp_cli",
+        "--config-file",
+        config_argument.c_str(),
+        "--text",
+        "command line text",
+    };
+    const auto expanded = minitts::cli::expand_cli_args(5, const_cast<char **>(argv));
+
+    engine::test::require_eq(expanded.size(), size_t{16}, "expected expanded argument count");
+    engine::test::require_eq(expanded[0], std::string("audiocpp_cli"), "executable preserved");
+    engine::test::require_eq(expanded[1], std::string("--text"), "CLI option retained first");
+    engine::test::require_eq(expanded[2], std::string("command line text"), "CLI value retained first");
+    engine::test::require_eq(expanded[3], std::string("--do-sample"), "boolean value option");
+    engine::test::require_eq(expanded[4], std::string("false"), "false value option");
+    engine::test::require_eq(expanded[5], std::string("--metrics"), "enabled flag emitted");
+    engine::test::require_eq(expanded[6], std::string("--model"), "scalar option emitted");
+    engine::test::require_eq(expanded[7], std::string("model.gguf"), "scalar option value emitted");
+    engine::test::require_eq(expanded[8], std::string("--request-option"), "sequence option emitted");
+    engine::test::require_eq(expanded[9], std::string("temperature=0.7"), "first sequence value emitted");
+    engine::test::require_eq(expanded[10], std::string("--request-option"), "repeated sequence option emitted");
+    engine::test::require_eq(expanded[11], std::string("top_k=10"), "second sequence value emitted");
+    engine::test::require_eq(expanded[12], std::string("--task"), "task option emitted");
+    engine::test::require_eq(expanded[13], std::string("tts"), "task value emitted");
+    engine::test::require_eq(expanded[14], std::string("--text"), "config text appended after CLI");
+    engine::test::require_eq(expanded[15], std::string("configured text"), "config text value appended");
+    engine::test::require(
+        std::find(expanded.begin(), expanded.end(), "--inspect") == expanded.end(),
+        "disabled boolean flag omitted");
+    engine::test::require(
+        std::find(expanded.begin(), expanded.end(), "--config-file") == expanded.end(),
+        "config-file argument consumed");
+    std::filesystem::remove(config_path);
+}
+
+void test_cli_key_value_options_override_yaml() {
+    const auto config_path = std::filesystem::temp_directory_path() /
+                             ("audiocpp-cli-config-overrides-" +
+                              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+                              ".yaml");
+    {
+        std::ofstream config(config_path);
+        config << "session-option:\n"
+               << "  - confucius4_r2t2.unfixed_chunk_num=2\n"
+               << "  - confucius4_r2t2.chunk_size_ms=320\n"
+               << "  - moe_policy=default\n"
+               << "  - moe_cpu_share=0.1\n"
+               << "  - moe_disk_experts=true\n"
+               << "  - moe_pin_experts=false\n"
+               << "  - moe_expert_cache_size=8\n"
+               << "  - moe_disk_expert_read_threads=1\n"
+               << "  - moe_cpu_expert_layers=2\n"
+               << "request-option: temperature=0.7\n";
+    }
+
+    const std::string config_argument = config_path.string();
+    const char * argv[] = {
+        "audiocpp_cli",
+        "--config-file",
+        config_argument.c_str(),
+        "--session-option",
+        "confucius4_r2t2.chunk_size_ms=640",
+        "--request-option",
+        "temperature=0.9",
+        "--request-option",
+        "top_k=10",
+        "--moe-policy",
+        "placement_cpu_share",
+        "--moe-cpu-share",
+        "0.5",
+        "--moe-disk-experts",
+        "false",
+        "--moe-pin-experts",
+        "true",
+        "--moe-expert-cache-size",
+        "16",
+        "--moe-disk-expert-read-threads",
+        "4",
+        "--moe-cpu-expert-layers",
+        "3",
+    };
+    const auto expanded = minitts::cli::expand_cli_args(static_cast<int>(sizeof(argv) / sizeof(argv[0])), const_cast<char **>(argv));
+    std::vector<char *> expanded_argv;
+    expanded_argv.reserve(expanded.size() + 1);
+    for (const auto & arg : expanded) {
+        expanded_argv.push_back(const_cast<char *>(arg.c_str()));
+    }
+    expanded_argv.push_back(nullptr);
+    const int expanded_argc = static_cast<int>(expanded.size());
+
+    const auto session_options =
+        minitts::cli::collect_key_value_args(expanded_argc, expanded_argv.data(), "--session-option");
+    const auto request_options =
+        minitts::cli::collect_key_value_args(expanded_argc, expanded_argv.data(), "--request-option");
+    engine::test::require_eq(
+        session_options.at("confucius4_r2t2.chunk_size_ms"),
+        std::string("640"),
+        "CLI session option overrides YAML");
+    engine::test::require_eq(
+        session_options.at("confucius4_r2t2.unfixed_chunk_num"),
+        std::string("2"),
+        "YAML session option retained");
+    for (const auto & key : {
+             "moe_policy",
+             "moe_cpu_share",
+             "moe_disk_experts",
+             "moe_pin_experts",
+             "moe_expert_cache_size",
+             "moe_disk_expert_read_threads",
+             "moe_cpu_expert_layers"}) {
+        engine::test::require(session_options.count(key) == 0, "CLI MoE option overrides YAML session option");
+    }
+    for (const auto & option : {
+             std::make_pair("--moe-policy", "placement_cpu_share"),
+             std::make_pair("--moe-cpu-share", "0.5"),
+             std::make_pair("--moe-disk-experts", "false"),
+             std::make_pair("--moe-pin-experts", "true"),
+             std::make_pair("--moe-expert-cache-size", "16"),
+             std::make_pair("--moe-disk-expert-read-threads", "4"),
+             std::make_pair("--moe-cpu-expert-layers", "3")}) {
+        engine::test::require_eq(
+            minitts::cli::find_arg(expanded_argc, expanded_argv.data(), option.first).value(),
+            std::string(option.second),
+            "CLI MoE value retained");
+    }
+    engine::test::require_eq(request_options.at("temperature"), std::string("0.9"), "CLI request option overrides YAML");
+    engine::test::require_eq(request_options.at("top_k"), std::string("10"), "CLI-only request option retained");
+    std::filesystem::remove(config_path);
+}
+
+void test_cli_option_aliases_and_load_options_override_yaml() {
+    const auto config_path = std::filesystem::temp_directory_path() /
+                             ("audiocpp-cli-config-alias-overrides-" +
+                              std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) +
+                              ".yaml");
+    {
+        std::ofstream config(config_path);
+        config << "request-option: temperature=0.7\n"
+               << "temperature: 0.6\n"
+               << "load-option:\n"
+               << "  - engine=fp16\n"
+               << "  - threads=4\n";
+    }
+
+    const std::string config_argument = config_path.string();
+    const char * alias_argv[] = {
+        "audiocpp_cli",
+        "--config-file",
+        config_argument.c_str(),
+        "--temperature",
+        "0.9",
+        "--load-option",
+        "engine=q8",
+    };
+    const auto alias_expanded = minitts::cli::expand_cli_args(7, const_cast<char **>(alias_argv));
+    std::vector<char *> alias_expanded_argv;
+    for (const auto & arg : alias_expanded) {
+        alias_expanded_argv.push_back(const_cast<char *>(arg.c_str()));
+    }
+    alias_expanded_argv.push_back(nullptr);
+    const int alias_expanded_argc = static_cast<int>(alias_expanded.size());
+    const auto alias_request_options =
+        minitts::cli::collect_key_value_args(alias_expanded_argc, alias_expanded_argv.data(), "--request-option");
+    const auto alias_load_options =
+        minitts::cli::collect_key_value_args(alias_expanded_argc, alias_expanded_argv.data(), "--load-option");
+    engine::test::require(alias_request_options.empty(), "CLI request alias overrides YAML request-option");
+    engine::test::require_eq(
+        minitts::cli::find_arg(alias_expanded_argc, alias_expanded_argv.data(), "--temperature").value(),
+        std::string("0.9"),
+        "CLI request alias value retained");
+    const auto alias_request = minitts::cli::build_request_from_cli(alias_expanded_argc, alias_expanded_argv.data());
+    engine::test::require_eq(alias_request.options.at("temperature"), std::string("0.9"), "CLI request alias wins");
+    engine::test::require_eq(alias_load_options.at("engine"), std::string("q8"), "CLI load option overrides YAML");
+    engine::test::require_eq(alias_load_options.at("threads"), std::string("4"), "non-overridden YAML load option retained");
+
+    const char * request_option_argv[] = {
+        "audiocpp_cli",
+        "--config-file",
+        config_argument.c_str(),
+        "--request-option",
+        "temperature=0.9",
+        "--load-option",
+        "engine=q8",
+    };
+    const auto request_option_expanded = minitts::cli::expand_cli_args(7, const_cast<char **>(request_option_argv));
+    std::vector<char *> request_option_expanded_argv;
+    for (const auto & arg : request_option_expanded) {
+        request_option_expanded_argv.push_back(const_cast<char *>(arg.c_str()));
+    }
+    request_option_expanded_argv.push_back(nullptr);
+    const int request_option_expanded_argc = static_cast<int>(request_option_expanded.size());
+    const auto request_options =
+        minitts::cli::collect_key_value_args(request_option_expanded_argc, request_option_expanded_argv.data(), "--request-option");
+    const auto load_options =
+        minitts::cli::collect_key_value_args(request_option_expanded_argc, request_option_expanded_argv.data(), "--load-option");
+    const auto request_option_request =
+        minitts::cli::build_request_from_cli(request_option_expanded_argc, request_option_expanded_argv.data());
+    engine::test::require_eq(request_options.at("temperature"), std::string("0.9"), "CLI request-option overrides YAML alias");
+    engine::test::require_eq(
+        request_option_request.options.at("temperature"),
+        std::string("0.9"),
+        "CLI request-option wins over YAML request alias");
+    engine::test::require(
+        !minitts::cli::find_arg(request_option_expanded_argc, request_option_expanded_argv.data(), "--temperature").has_value(),
+        "overridden YAML request alias omitted");
+    engine::test::require_eq(load_options.at("engine"), std::string("q8"), "CLI load option retained");
+    engine::test::require_eq(load_options.at("threads"), std::string("4"), "non-overridden YAML load option retained");
+    std::filesystem::remove(config_path);
+}
+
+void test_config_file_token_used_as_option_value() {
+    const char * argv[] = {"audiocpp_cli", "--help", "--log", "--text", "--config-file"};
+    const auto expanded = minitts::cli::expand_cli_args(5, const_cast<char **>(argv));
+    engine::test::require_eq(expanded.size(), size_t{5}, "config-file token retained as text value");
+    engine::test::require_eq(expanded.back(), std::string("--config-file"), "config-file token not parsed as option");
+}
+
 }  // namespace
 
 int main() {
     test_large_safe_integer_numbers_stay_decimal();
     test_float_numbers_keep_json_formatting();
     test_unsafe_integer_numbers_are_not_silently_rounded();
+    test_malformed_seeds_are_invalid_requests();
     test_audio_only_language_is_request_option();
+    test_audio_chunk_shortcut_uses_canonical_name();
+    test_normalized_request_option_aliases();
     test_out_format_selects_wav_sample_format();
+    test_request_json_artifacts();
+    test_request_json_voice_ref();
+    test_component_exec_plans();
+    test_non_negative_int_flag_values();
+    test_cli_arguments_can_be_loaded_from_yaml();
+    test_cli_key_value_options_override_yaml();
+    test_cli_option_aliases_and_load_options_override_yaml();
+    test_config_file_token_used_as_option_value();
     std::cout << "cli_request_options_test passed\n";
     return 0;
 }

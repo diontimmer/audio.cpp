@@ -262,19 +262,16 @@ int main(int argc, char ** argv) {
             }
         }
 
-        // NOTE: these env vars are not actually read by the logging subsystem
-        // (engine::debug::configure_logging() below is what wires it up);
-        // kept for parity with the timing-file convention other warm_bench
-        // tools advertise via --help / env, not because anything consumes them.
-        setenv("ENGINE_TRACE_ENABLED", "0", 1);
-        setenv("ENGINE_TIMING_ENABLED", "1", 1);
-        setenv("ENGINE_TIMING_FILE", timing_path.c_str(), 1);
+        // Configure logging directly. The old setenv calls were unused by
+        // the logger and prevented this benchmark from building with MSVC.
         engine::debug::configure_logging(engine::debug::LoggingConfig{true, timing_path.string()});
 
         auto registry = engine::runtime::make_default_registry();
         engine::runtime::ModelLoadRequest load_request;
         load_request.model_path = model_path;
         load_request.family_hint = "parakeet_tdt";
+        const auto spec_override = arg_value(argc, argv, "--model-spec-override", "");
+        if (!spec_override.empty()) load_request.model_spec_override = spec_override;
         auto model = registry.load(load_request);
 
         engine::runtime::SessionOptions session_options;
@@ -360,8 +357,8 @@ int main(int argc, char ** argv) {
                 steps.reserve(wavs.size());
                 streaming_last_wall_ms = 0.0;
                 for (size_t wav_index = 0; wav_index < wavs.size(); ++wav_index) {
-                    session->reset();
                     const auto started = std::chrono::steady_clock::now();
+                    session->start_stream({});
                     const auto & wav = wavs[wav_index];
                     const auto & samples = wav.samples;
                     const size_t chunk_size_samples = static_cast<size_t>(chunk_size);

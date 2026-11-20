@@ -20,8 +20,9 @@
       {
         "name": "max_tokens",
         "type": "int",
-        "description": "Generation control; defaults to the checkpoint config.",
-        "required": false
+        "description": "Maximum generated tokens; default 700.",
+        "required": false,
+        "min": 1
       },
       {
         "name": "top_k",
@@ -33,31 +34,41 @@
         "name": "top_p",
         "type": "float",
         "description": "Generation control; defaults to the checkpoint config.",
-        "required": false
+        "required": false,
+        "min": 0,
+        "max": 1
       },
       {
         "name": "temperature",
         "type": "float",
         "description": "Generation control; defaults to the checkpoint config.",
-        "required": false
+        "required": false,
+        "min": 0,
+        "max": 2
       },
       {
         "name": "repetition_penalty",
         "type": "float",
         "description": "Generation control; defaults to the checkpoint config.",
-        "required": false
+        "required": false,
+        "min": 1,
+        "max": 1.5
       },
       {
         "name": "presence_penalty",
         "type": "float",
-        "description": "Generation control; defaults to the checkpoint config.",
-        "required": false
+        "description": "Presence penalty; default 0.",
+        "required": false,
+        "min": 0,
+        "max": 1
       },
       {
         "name": "frequency_penalty",
         "type": "float",
-        "description": "Generation control; defaults to the checkpoint config.",
-        "required": false
+        "description": "Frequency penalty; default 0.",
+        "required": false,
+        "min": 0,
+        "max": 1
       },
       {
         "name": "do_sample",
@@ -101,7 +112,8 @@
         "name": "text_chunk_size",
         "type": "int",
         "description": "Framework long-form text chunk size; inherits the session setting.",
-        "required": false
+        "required": false,
+        "min": 1
       }
     ],
     "session": [
@@ -127,9 +139,8 @@
       {
         "name": "text_chunk_size",
         "type": "int",
-        "description": "Default framework text chunk size.",
-        "required": false,
-        "default": 180
+        "description": "Default framework text chunk size; 120 when hanzi, kana and Hangul outnumber other letters and digits, otherwise 180.",
+        "required": false
       },
       {
         "name": "best_of_n_enabled",
@@ -172,7 +183,7 @@
         "description": "Context or graph arena size in MiB.",
         "required": false,
         "min": 1,
-        "default": 1024
+        "default": 32
       },
       {
         "name": "decode_graph_arena_mb",
@@ -180,7 +191,7 @@
         "description": "Context or graph arena size in MiB.",
         "required": false,
         "min": 1,
-        "default": 1024
+        "default": 32
       },
       {
         "name": "weight_context_mb",
@@ -188,7 +199,7 @@
         "description": "Context or graph arena size in MiB.",
         "required": false,
         "min": 1,
-        "default": 512
+        "default": 8
       },
       {
         "name": "codec_weight_context_mb",
@@ -196,7 +207,7 @@
         "description": "Context or graph arena size in MiB.",
         "required": false,
         "min": 1,
-        "default": 256
+        "default": 8
       },
       {
         "name": "codec_constant_context_mb",
@@ -204,7 +215,7 @@
         "description": "Context or graph arena size in MiB.",
         "required": false,
         "min": 1,
-        "default": 256
+        "default": 16
       },
       {
         "name": "global_graph_arena_mb",
@@ -212,7 +223,7 @@
         "description": "Context or graph arena size in MiB.",
         "required": false,
         "min": 1,
-        "default": 256
+        "default": 32
       },
       {
         "name": "wave_graph_arena_mb",
@@ -220,7 +231,7 @@
         "description": "Context or graph arena size in MiB.",
         "required": false,
         "min": 1,
-        "default": 512
+        "default": 32
       }
     ],
     "load": []

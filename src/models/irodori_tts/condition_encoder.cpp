@@ -163,6 +163,45 @@ IrodoriModernBertLayerWeights load_modernbert_layer(
   return weights;
 }
 
+modules::T5GemmaEncoderLayerWeights load_t5gemma_layer(
+    core::BackendWeightStore &store, const assets::TensorSource &source,
+    const std::string &prefix, assets::TensorStorageType storage_type,
+    const IrodoriModelConfig &config) {
+  const int64_t hidden = config.pretrained_text_dim;
+  const int64_t head_dim = config.pretrained_text_head_dim;
+  const int64_t attention_size = config.pretrained_text_heads * head_dim;
+  const int64_t kv_size = config.pretrained_text_kv_heads * head_dim;
+  const int64_t ffn = config.pretrained_text_intermediate_dim;
+  modules::T5GemmaEncoderLayerWeights weights;
+  weights.pre_self_attn_norm = store.load_f32_tensor(
+      source, prefix + ".pre_self_attn_layernorm.weight", {hidden});
+  weights.post_self_attn_norm = store.load_f32_tensor(
+      source, prefix + ".post_self_attn_layernorm.weight", {hidden});
+  weights.pre_ff_norm = store.load_f32_tensor(
+      source, prefix + ".pre_feedforward_layernorm.weight", {hidden});
+  weights.post_ff_norm = store.load_f32_tensor(
+      source, prefix + ".post_feedforward_layernorm.weight", {hidden});
+  weights.q_proj = load_linear(store, source, prefix + ".self_attn.q_proj",
+                               storage_type, attention_size, hidden, false);
+  weights.k_proj = load_linear(store, source, prefix + ".self_attn.k_proj",
+                               storage_type, kv_size, hidden, false);
+  weights.v_proj = load_linear(store, source, prefix + ".self_attn.v_proj",
+                               storage_type, kv_size, hidden, false);
+  weights.o_proj = load_linear(store, source, prefix + ".self_attn.o_proj",
+                               storage_type, hidden, attention_size, false);
+  weights.q_norm = binding::norm_weight_from_source(
+      store, source, prefix + ".self_attn.q_norm", head_dim);
+  weights.k_norm = binding::norm_weight_from_source(
+      store, source, prefix + ".self_attn.k_norm", head_dim);
+  weights.gate_proj = load_linear(store, source, prefix + ".mlp.gate_proj",
+                                  storage_type, ffn, hidden, false);
+  weights.up_proj = load_linear(store, source, prefix + ".mlp.up_proj",
+                                storage_type, ffn, hidden, false);
+  weights.down_proj = load_linear(store, source, prefix + ".mlp.down_proj",
+                                  storage_type, hidden, ffn, false);
+  return weights;
+}
+
 IrodoriPretrainedProjectorWeights load_pretrained_projector(
     core::BackendWeightStore &store, const assets::TensorSource &source,
     const std::string &prefix, assets::TensorStorageType storage_type,
@@ -497,7 +536,22 @@ IrodoriConditionEncoderWeights load_irodori_condition_encoder_weights(
       backend, backend_type, "irodori_tts.condition_encoder.weights",
       weight_context_bytes == 0 ? kConditionEncoderWeightContextBytes
                                 : weight_context_bytes);
-  if (config.use_pretrained_text_encoder()) {
+  if (config.use_t5gemma2_text_encoder()) {
+    weights.pretrained_t5gemma.embed_tokens = weights.store->load_tensor(
+        source, "pretrained_text_backbone.backbone.embed_tokens.weight",
+        weight_storage_type, {config.text_vocab_size, config.pretrained_text_dim});
+    weights.pretrained_t5gemma.norm = weights.store->load_f32_tensor(
+        source, "pretrained_text_backbone.backbone.norm.weight",
+        {config.pretrained_text_dim});
+    weights.pretrained_t5gemma.layers.reserve(
+        static_cast<size_t>(config.pretrained_text_layers));
+    for (int64_t layer = 0; layer < config.pretrained_text_layers; ++layer) {
+      weights.pretrained_t5gemma.layers.push_back(load_t5gemma_layer(
+          *weights.store, source,
+          "pretrained_text_backbone.backbone.layers." + std::to_string(layer),
+          weight_storage_type, config));
+    }
+  } else if (config.use_pretrained_text_encoder()) {
     weights.pretrained_text.embedding = weights.store->load_tensor(
         source, "pretrained_text_backbone.backbone.embeddings.tok_embeddings.weight",
         weight_storage_type, {config.text_vocab_size, config.pretrained_text_dim});
@@ -515,6 +569,8 @@ IrodoriConditionEncoderWeights load_irodori_condition_encoder_weights(
           "pretrained_text_backbone.backbone.layers." + std::to_string(layer),
           weight_storage_type, config, layer));
     }
+  }
+  if (config.use_pretrained_text_encoder()) {
     weights.text_projector = load_pretrained_projector(
         *weights.store, source, "text_encoder", weight_storage_type, config,
         config.text_dim);
@@ -548,8 +604,10 @@ IrodoriConditionEncoderWeights load_irodori_condition_encoder_weights(
   weights.speaker_norm = weights.store->load_f32_tensor(
       source, "speaker_norm.weight", {config.speaker_dim});
 
-  weights.duration.null_speaker = weights.store->load_f32_tensor(
-      source, "duration_predictor.null_speaker", {config.speaker_dim});
+  if (config.use_duration_predictor) {
+    weights.duration.null_speaker = weights.store->load_f32_tensor(
+        source, "duration_predictor.null_speaker", {config.speaker_dim});
+  }
   if (config.use_caption_condition) {
     if (config.use_pretrained_text_encoder()) {
       weights.caption_projector = load_pretrained_projector(
@@ -573,27 +631,31 @@ IrodoriConditionEncoderWeights load_irodori_condition_encoder_weights(
       weights.caption_norm = weights.store->load_f32_tensor(
           source, "caption_norm.weight", {config.caption_dim_resolved()});
     }
-    weights.duration.null_caption = weights.store->load_f32_tensor(
-        source, "duration_predictor.null_caption",
-        {config.caption_dim_resolved()});
+    if (config.use_duration_predictor) {
+      weights.duration.null_caption = weights.store->load_f32_tensor(
+          source, "duration_predictor.null_caption",
+          {config.caption_dim_resolved()});
+    }
   }
-  weights.duration.token_input_proj = load_linear(
-      *weights.store, source, "duration_predictor.token_input_proj",
-      weight_storage_type, config.duration_hidden_dim, config.text_dim, true);
-  weights.duration.token_blocks.reserve(
-      static_cast<size_t>(config.duration_layers));
-  for (int64_t layer = 0; layer < config.duration_layers; ++layer) {
-    weights.duration.token_blocks.push_back(load_duration_block(
-        *weights.store, source,
-        "duration_predictor.token_blocks." + std::to_string(layer),
-        weight_storage_type, config));
+  if (config.use_duration_predictor) {
+    weights.duration.token_input_proj = load_linear(
+        *weights.store, source, "duration_predictor.token_input_proj",
+        weight_storage_type, config.duration_hidden_dim, config.text_dim, true);
+    weights.duration.token_blocks.reserve(
+        static_cast<size_t>(config.duration_layers));
+    for (int64_t layer = 0; layer < config.duration_layers; ++layer) {
+      weights.duration.token_blocks.push_back(load_duration_block(
+          *weights.store, source,
+          "duration_predictor.token_blocks." + std::to_string(layer),
+          weight_storage_type, config));
+    }
+    weights.duration.token_out_norm = weights.store->load_f32_tensor(
+        source, "duration_predictor.token_out_norm.weight",
+        {config.duration_hidden_dim});
+    weights.duration.token_out_proj =
+        load_linear(*weights.store, source, "duration_predictor.token_out_proj",
+                    weight_storage_type, 1, config.duration_hidden_dim, true);
   }
-  weights.duration.token_out_norm = weights.store->load_f32_tensor(
-      source, "duration_predictor.token_out_norm.weight",
-      {config.duration_hidden_dim});
-  weights.duration.token_out_proj =
-      load_linear(*weights.store, source, "duration_predictor.token_out_proj",
-                  weight_storage_type, 1, config.duration_hidden_dim, true);
   weights.store->upload();
   return weights;
 }
@@ -720,6 +782,61 @@ core::TensorValue build_modernbert_backbone(
   return modules::MaskingModule{}.build(ctx, hidden, mask);
 }
 
+// The encoder half of T5Gemma 2 (Gemma 3 layers, bidirectional attention).
+// The eoi_embedding that Hugging Face swaps in for the end-of-image token is
+// not applied: Irodori text never carries image tokens.
+core::TensorValue build_t5gemma_backbone(
+    core::ModuleBuildContext &ctx, const core::TensorValue &input_ids,
+    const core::TensorValue &mask, const core::TensorValue &attention_mask,
+    const core::TensorValue &positions,
+    const IrodoriConditionEncoderWeights &weights,
+    const IrodoriModelConfig &config) {
+  modules::T5GemmaEncoderConfig encoder;
+  encoder.hidden_size = config.pretrained_text_dim;
+  encoder.layers = config.pretrained_text_layers;
+  encoder.attention_heads = config.pretrained_text_heads;
+  encoder.kv_heads = config.pretrained_text_kv_heads;
+  encoder.head_dim = config.pretrained_text_head_dim;
+  encoder.attention_size =
+      config.pretrained_text_heads * config.pretrained_text_head_dim;
+  encoder.intermediate_size = config.pretrained_text_intermediate_dim;
+  encoder.vocab_size = config.text_vocab_size;
+  encoder.rms_norm_eps = config.pretrained_text_rms_norm_eps;
+  encoder.query_pre_attn_scalar = config.pretrained_text_query_pre_attn_scalar;
+  encoder.attn_logit_softcap = config.pretrained_text_attn_logit_softcap;
+  encoder.scale_embeddings = true;
+  encoder.use_qk_norm = true;
+  encoder.rms_norm_style = modules::T5GemmaRMSNormStyle::Gemma;
+  for (const auto &layer_type : config.pretrained_text_layer_types) {
+    const bool sliding = layer_type == "sliding_attention";
+    encoder.layer_rope_theta.push_back(
+        sliding ? config.pretrained_text_sliding_rope_theta
+                : config.pretrained_text_full_rope_theta);
+    encoder.layer_rope_freq_scale.push_back(
+        sliding ? config.pretrained_text_sliding_rope_freq_scale
+                : config.pretrained_text_full_rope_freq_scale);
+  }
+  auto hidden = modules::T5GemmaEncoderModule(encoder).build(
+      ctx, input_ids, positions, attention_mask, weights.pretrained_t5gemma);
+  return modules::MaskingModule{}.build(ctx, hidden, mask);
+}
+
+core::TensorValue build_pretrained_backbone(
+    core::ModuleBuildContext &ctx, const core::TensorValue &input_ids,
+    const core::TensorValue &mask, const core::TensorValue &full_attention_mask,
+    const core::TensorValue &sliding_attention_mask,
+    const core::TensorValue &positions,
+    const IrodoriConditionEncoderWeights &weights,
+    const IrodoriModelConfig &config) {
+  if (config.use_t5gemma2_text_encoder()) {
+    return build_t5gemma_backbone(ctx, input_ids, mask, full_attention_mask,
+                                  positions, weights, config);
+  }
+  return build_modernbert_backbone(ctx, input_ids, mask, full_attention_mask,
+                                   sliding_attention_mask, positions, weights,
+                                   config);
+}
+
 core::TensorValue build_pretrained_projector(
     core::ModuleBuildContext &ctx, const core::TensorValue &backbone_state,
     const core::TensorValue &mask,
@@ -758,7 +875,7 @@ core::TensorValue build_irodori_text_encoder(
     const IrodoriConditionEncoderWeights &weights,
     const IrodoriModelConfig &config) {
   if (config.use_pretrained_text_encoder()) {
-    auto backbone = build_modernbert_backbone(
+    auto backbone = build_pretrained_backbone(
         ctx, input_ids, text_mask, attention_mask, sliding_attention_mask,
         positions, weights, config);
     auto projected = build_pretrained_projector(
@@ -817,7 +934,7 @@ core::TensorValue build_irodori_caption_encoder(
     const IrodoriConditionEncoderWeights &weights,
     const IrodoriModelConfig &config) {
   if (config.use_pretrained_text_encoder()) {
-    auto backbone = build_modernbert_backbone(
+    auto backbone = build_pretrained_backbone(
         ctx, input_ids, caption_mask, attention_mask, sliding_attention_mask,
         positions, weights, config);
     auto projected = build_pretrained_projector(
@@ -988,6 +1105,13 @@ std::vector<float> make_text_attention_mask(const std::vector<uint8_t> &mask,
     }
   }
   return out;
+}
+
+// ModernBERT's local layers read a separate sliding-window mask. T5Gemma 2
+// layers all use the full mask (checked against sliding_window at load).
+bool uses_sliding_attention_mask(const IrodoriModelConfig &config) {
+  return config.use_pretrained_text_encoder() &&
+         !config.use_t5gemma2_text_encoder();
 }
 
 std::vector<int32_t> positions(int64_t count) {
@@ -1253,7 +1377,7 @@ private:
           core::make_tensor(build_ctx, GGML_TYPE_F32,
                             core::TensorShape::from_dims(
                                 {1, text_heads, tokens_, tokens_}));
-      if (config.use_pretrained_text_encoder()) {
+      if (uses_sliding_attention_mask(config)) {
         text_sliding_attention_mask_ =
             core::make_tensor(build_ctx, GGML_TYPE_F32,
                               core::TensorShape::from_dims(
@@ -1276,7 +1400,7 @@ private:
             core::TensorShape::from_dims({1, caption_heads,
                                           config.max_caption_len,
                                           config.max_caption_len}));
-        if (config.use_pretrained_text_encoder()) {
+        if (uses_sliding_attention_mask(config)) {
           caption_sliding_attention_mask_ = core::make_tensor(
               build_ctx, GGML_TYPE_F32,
               core::TensorShape::from_dims({1, caption_heads,
@@ -1287,19 +1411,24 @@ private:
             build_ctx, GGML_TYPE_I32,
             core::TensorShape::from_dims({config.max_caption_len}));
       }
-      speaker_state_ = core::make_tensor(
-          build_ctx, GGML_TYPE_F32,
-          core::TensorShape::from_dims({1, 2, config.speaker_dim}));
-      has_speaker_ = core::make_tensor(build_ctx, GGML_TYPE_I32,
-                                       core::TensorShape::from_dims({1}));
-      if (config.use_caption_condition) {
-        has_caption_ = core::make_tensor(build_ctx, GGML_TYPE_I32,
+      // The speaker and caption flags feed only the duration predictor. Without
+      // one they would be graph inputs that no node reads, which gallocr leaves
+      // without storage, so they are not created at all.
+      if (config.use_duration_predictor) {
+        speaker_state_ = core::make_tensor(
+            build_ctx, GGML_TYPE_F32,
+            core::TensorShape::from_dims({1, 2, config.speaker_dim}));
+        has_speaker_ = core::make_tensor(build_ctx, GGML_TYPE_I32,
                                          core::TensorShape::from_dims({1}));
+        if (config.use_caption_condition) {
+          has_caption_ = core::make_tensor(build_ctx, GGML_TYPE_I32,
+                                           core::TensorShape::from_dims({1}));
+        }
       }
       ggml_set_input(input_ids_.tensor);
       ggml_set_input(text_mask_.tensor);
       ggml_set_input(text_attention_mask_.tensor);
-      if (config.use_pretrained_text_encoder()) {
+      if (uses_sliding_attention_mask(config)) {
         ggml_set_input(text_sliding_attention_mask_.tensor);
       }
       ggml_set_input(positions_.tensor);
@@ -1307,20 +1436,22 @@ private:
         ggml_set_input(caption_ids_.tensor);
         ggml_set_input(caption_mask_.tensor);
         ggml_set_input(caption_attention_mask_.tensor);
-        if (config.use_pretrained_text_encoder()) {
+        if (uses_sliding_attention_mask(config)) {
           ggml_set_input(caption_sliding_attention_mask_.tensor);
         }
         ggml_set_input(caption_positions_.tensor);
       }
-      ggml_set_input(speaker_state_.tensor);
-      ggml_set_input(has_speaker_.tensor);
-      if (config.use_caption_condition) {
-        ggml_set_input(has_caption_.tensor);
+      if (config.use_duration_predictor) {
+        ggml_set_input(speaker_state_.tensor);
+        ggml_set_input(has_speaker_.tensor);
+        if (config.use_caption_condition) {
+          ggml_set_input(has_caption_.tensor);
+        }
       }
 
       auto text = build_irodori_text_encoder(build_ctx, input_ids_, text_mask_,
                                              text_attention_mask_,
-                                             config.use_pretrained_text_encoder()
+                                             uses_sliding_attention_mask(config)
                                                  ? text_sliding_attention_mask_
                                                  : text_attention_mask_,
                                              positions_,
@@ -1329,7 +1460,7 @@ private:
       if (config.use_caption_condition) {
         auto caption = build_irodori_caption_encoder(
             build_ctx, caption_ids_, caption_mask_, caption_attention_mask_,
-            config.use_pretrained_text_encoder()
+            uses_sliding_attention_mask(config)
                 ? caption_sliding_attention_mask_
                 : caption_attention_mask_,
             caption_positions_,
@@ -1337,22 +1468,29 @@ private:
         output_caption_ =
             core::ensure_backend_addressable_layout(build_ctx, caption);
       }
-      auto duration = build_irodori_duration_predictor(
-          build_ctx, output_text_, text_mask_, speaker_state_, has_speaker_,
-          output_caption_, caption_mask_, has_caption_, owner.weights_, config);
-      output_duration_ =
-          core::ensure_backend_addressable_layout(build_ctx, duration);
+      if (config.use_duration_predictor) {
+        auto duration = build_irodori_duration_predictor(
+            build_ctx, output_text_, text_mask_, speaker_state_, has_speaker_,
+            output_caption_, caption_mask_, has_caption_, owner.weights_,
+            config);
+        output_duration_ =
+            core::ensure_backend_addressable_layout(build_ctx, duration);
+      }
       ggml_set_output(output_text_.tensor);
       if (config.use_caption_condition) {
         ggml_set_output(output_caption_.tensor);
       }
-      ggml_set_output(output_duration_.tensor);
+      if (config.use_duration_predictor) {
+        ggml_set_output(output_duration_.tensor);
+      }
       graph_ = ggml_new_graph_custom(ctx_.get(), 65536, false);
       ggml_build_forward_expand(graph_, output_text_.tensor);
       if (config.use_caption_condition) {
         ggml_build_forward_expand(graph_, output_caption_.tensor);
       }
-      ggml_build_forward_expand(graph_, output_duration_.tensor);
+      if (config.use_duration_predictor) {
+        ggml_build_forward_expand(graph_, output_duration_.tensor);
+      }
       gallocr_ = ggml_gallocr_new(
           ggml_backend_get_default_buffer_type(owner.backend_));
       if (gallocr_ == nullptr || !ggml_gallocr_reserve(gallocr_, graph_) ||
@@ -1365,13 +1503,15 @@ private:
         core::write_tensor_i32(caption_positions_,
                                positions(config.max_caption_len));
       }
-      core::write_tensor_f32(
-          speaker_state_,
-          std::vector<float>(static_cast<size_t>(2 * config.speaker_dim),
-                             0.0F));
-      core::write_tensor_i32(has_speaker_, std::vector<int32_t>{0});
-      if (config.use_caption_condition) {
-        core::write_tensor_i32(has_caption_, std::vector<int32_t>{0});
+      if (config.use_duration_predictor) {
+        core::write_tensor_f32(
+            speaker_state_,
+            std::vector<float>(static_cast<size_t>(2 * config.speaker_dim),
+                               0.0F));
+        core::write_tensor_i32(has_speaker_, std::vector<int32_t>{0});
+        if (config.use_caption_condition) {
+          core::write_tensor_i32(has_caption_, std::vector<int32_t>{0});
+        }
       }
     }
 
@@ -1404,7 +1544,7 @@ private:
             caption_attention_mask_,
             make_text_attention_mask(caption.mask, 1, caption_heads,
                                      config.max_caption_len));
-        if (config.use_pretrained_text_encoder()) {
+        if (uses_sliding_attention_mask(config)) {
           core::write_tensor_f32(
               caption_sliding_attention_mask_,
               make_text_attention_mask(caption.mask, 1, caption_heads,
@@ -1412,13 +1552,16 @@ private:
                                        config.pretrained_text_sliding_window));
         }
       }
-      core::write_tensor_f32(
-          speaker_state_, duration_speaker_state(speaker, config.speaker_dim));
-      core::write_tensor_i32(has_speaker_,
-                             std::vector<int32_t>{speaker.has_speaker ? 1 : 0});
-      if (config.use_caption_condition) {
+      if (config.use_duration_predictor) {
+        core::write_tensor_f32(
+            speaker_state_,
+            duration_speaker_state(speaker, config.speaker_dim));
         core::write_tensor_i32(
-            has_caption_, std::vector<int32_t>{caption.has_caption ? 1 : 0});
+            has_speaker_, std::vector<int32_t>{speaker.has_speaker ? 1 : 0});
+        if (config.use_caption_condition) {
+          core::write_tensor_i32(
+              has_caption_, std::vector<int32_t>{caption.has_caption ? 1 : 0});
+        }
       }
       core::write_tensor_f32(
           text_attention_mask_,
@@ -1427,7 +1570,7 @@ private:
               config.use_pretrained_text_encoder() ? config.pretrained_text_heads
                                                    : config.text_heads,
               tokens_));
-      if (config.use_pretrained_text_encoder()) {
+      if (uses_sliding_attention_mask(config)) {
         core::write_tensor_f32(
             text_sliding_attention_mask_,
             make_text_attention_mask(token_mask, 1, config.pretrained_text_heads,
@@ -1447,8 +1590,11 @@ private:
       if (config.use_caption_condition) {
         output.caption_state = core::read_tensor_f32(output_caption_.tensor);
       }
-      const auto duration = core::read_tensor_f32(output_duration_.tensor);
-      output.predicted_log_frames = duration.empty() ? 0.0F : duration.front();
+      if (config.use_duration_predictor) {
+        const auto duration = core::read_tensor_f32(output_duration_.tensor);
+        output.predicted_log_frames =
+            duration.empty() ? 0.0F : duration.front();
+      }
       return output;
     }
 

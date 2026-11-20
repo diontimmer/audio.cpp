@@ -1,3 +1,4 @@
+#include "engine/framework/runtime/moe_options.h"
 #include "args.h"
 #include "batch.h"
 #include "partial_render.h"
@@ -9,13 +10,18 @@
 #include "../workflow/file_sink.h"
 #include "../workflow/pipeline.h"
 #include "../workflow/workflow.h"
+#include "../recipe/cli_recipe.h"
+#include "../recipe/recipe.h"
 
 #include "engine/framework/audio/chunking.h"
 #include "engine/framework/audio/conversion.h"
+#include "engine/framework/audio/resampling.h"
+#include "engine/framework/core/load_progress.h"
 #include "engine/framework/debug/trace.h"
 #include "engine/framework/io/json.h"
 #include "engine/framework/runtime/registry.h"
 #include "engine/framework/runtime/session.h"
+#include "engine/framework/runtime/options.h"
 
 #include <algorithm>
 #include <chrono>
@@ -53,23 +59,36 @@ void print_task_list_help() {
         << "audiocpp_cli --task <task> --family <family> --model <path> --backend <backend> [options]\n"
         << "  Global:\n"
         << "    --version  Print build version, commit, compiler, platform, and enabled backends\n"
-        << "    --task vad|asr|diar|sep|gen|tts|clon|vc|s2s|align|vdes|spk|svc|midi\n"
+        << "    --task vad|asr|diar|sep|gen|tts|clon|vc|s2s|align|vdes|spk|svc|midi|wake|cls\n"
         << "    --family <name>\n"
         << "    --model <path>\n"
-        << "    --backend cpu|cuda|hip|rocm|vulkan|metal|best  (rocm is an alias for hip)\n"
+        << "    --backend cpu|cuda|hip|rocm|vulkan|metal|webgpu|sycl|best  (rocm is an alias for hip)\n"
         << "    --mode offline|streaming  default offline\n"
         << "    --device <n>\n"
-        << "    --list-devices  List available backend devices and exit\n"
+        << "    --backend-impl <name>             optional backend implementation; default preserves existing dispatch\n"
+        << "    --list-devices  List available backend devices and exit; --json adds PCI ids and memory\n"
         << "    --threads <n>  Backend and OpenMP worker threads, default 4\n"
+        << "    --config-file <yaml>  Load CLI options from YAML; explicit scalar CLI values take precedence\n"
         << "    --registry-config <path>\n"
-        << "    --model-spec-override <json-or-directory>  Override package-spec resolution\n"
+        << "    --model-spec-override <json-or-directory|embedded>  Select a spec file/directory or the GGUF's embedded spec\n"
         << "    --config <id>\n"
         << "    --weight <id>\n"
         << "    --log  Stream framework progress and timing logs to stdout\n"
         << "    --log-file <path>  Stream framework progress and timing logs to a file\n"
+        << "    --load-progress 0|1  with --log/--log-file, emit model-load progress keys\n"
+        << "                (runtime.load.phase, <store>.weights.upload_progress); default 0\n"
+        << "    --resample-kernel-cache-mb <mb>  Resampling kernel cache in MiB, default 32; 0 disables it\n"
+        << "                (a kernel larger than this is rebuilt on every call)\n"
         << "    --metrics  Print compact wall time, audio duration, and RTF summary after offline generation\n"
         << "    --load-option key=value\n"
         << "    --session-option key=value\n"
+        << "    --moe-policy <placement[,eviction]> select independent MoE execution/cache policies\n"
+        << "    --moe-cpu-share <0..1>             session CPU share of disk-expert cache misses; default 0\n"
+        << "    --moe-disk-experts <bool>         stage expert weights through bounded caches\n"
+        << "    --moe-pin-experts <bool>          pin staged expert banks in host RAM\n"
+        << "    --moe-expert-cache-size <int>     expert slots per routed layer\n"
+        << "    --moe-disk-expert-read-threads <int>  host expert read workers\n"
+        << "    --moe-cpu-expert-layers <int>     first N MoE layers execute on CPU\n"
         << "    --request-option key=value\n"
         << "  Batch:\n"
         << "    --request-sequence <json>  Run JSON requests in one offline session\n"
@@ -85,6 +104,12 @@ void print_task_list_help() {
         << "    --list-pipelines\n"
         << "    --workflow-input key=value  Override a top-level workflow input\n"
         << "    --audio-converter <cmd>  Converter executable for workflow media import, default ffmpeg\n"
+        << "  Recipes:\n"
+        << "    --recipe <name>  Run a built-in multi-model recipe\n"
+        << "    --list-recipes\n"
+        << "    --recipe-model role=path  Select a model file or directory for a recipe role\n"
+        << "    --recipe-family role=family  Select the model family for a recipe role\n"
+        << "    Prefix --load-option and --session-option keys with role., e.g. tts.weight_type=q8_0\n"
         << "  Task routing and media roles:\n"
         << "    --task-route <name>  User-facing route, e.g. text2music, zero_shot_tts, style_preserved_vc\n"
         << "    --source-audio <wav>  Source audio path for models that take path-based source refs\n"
@@ -153,7 +178,7 @@ void print_task_list_help() {
         << "    --vad-chunk-padding-seconds <float>  Pad each VAD span before chunking, default 0.25\n"
         << "    --turns-out <json>\n"
         << "    --words-out <json>\n"
-        << "    --voice-state-out <safetensors>  Export PocketTTS voice state from --voice-ref\n"
+        << "    --voice-state-out <safetensors>  Export a prepared voice state when supported by the model\n"
         << "  Streaming:\n"
         << "    --mode streaming uses the selected model's default streaming policy\n"
         << "  Utility:\n"
@@ -174,7 +199,9 @@ void print_task_list_help() {
         << "    vdes   voice design\n"
         << "    spk    speaker embedding/recognition\n"
         << "    svc    singing voice conversion\n"
-        << "    midi   audio-to-symbolic MIDI/event transcription\n";
+        << "    midi   audio-to-symbolic MIDI/event transcription\n"
+        << "    wake   wake-word detection\n"
+        << "    cls    audio classification\n";
 }
 
 void print_option_group(const char * title, const std::vector<engine::runtime::CliOptionInfo> & options) {
@@ -204,7 +231,7 @@ bool model_supports_task(const engine::runtime::ModelInspection & inspection, en
 }
 
 void print_model_common_options(const engine::runtime::ModelInspection & inspection) {
-    std::cout << "  Available input options:\n";
+    std::cout << "  Common input options (not all options apply to every model; see the model-specific documentation):\n";
     if (model_supports_task(inspection, engine::runtime::VoiceTaskKind::AudioGeneration)) {
         std::cout
             << "    --text <text>\n"
@@ -272,6 +299,8 @@ void print_model_common_options(const engine::runtime::ModelInspection & inspect
     }
     if (model_supports_task(inspection, engine::runtime::VoiceTaskKind::Asr) ||
         model_supports_task(inspection, engine::runtime::VoiceTaskKind::Vad) ||
+        model_supports_task(inspection, engine::runtime::VoiceTaskKind::WakeWord) ||
+        model_supports_task(inspection, engine::runtime::VoiceTaskKind::AudioClassification) ||
         model_supports_task(inspection, engine::runtime::VoiceTaskKind::Diarization) ||
         model_supports_task(inspection, engine::runtime::VoiceTaskKind::SourceSeparation) ||
         model_supports_task(inspection, engine::runtime::VoiceTaskKind::Midi) ||
@@ -543,6 +572,9 @@ void run_streaming(
     minitts::cli::PartialTextRenderer partial_renderer(stdout_is_terminal());
     const minitts::app::StreamEventSink sink =
         [&](const engine::runtime::StreamEvent & event) {
+            if (event.partial_text_snapshot.has_value()) {
+                std::cout << partial_renderer.render_snapshot(event.partial_text_snapshot->text) << std::flush;
+            }
             if (event.partial_text.has_value()) {
                 // Flushed so a live source's partials appear as they are produced rather than
                 // when the stdio buffer happens to fill.
@@ -641,6 +673,19 @@ int audiocpp_cli_main(int argc, char ** argv) {
             has_arg(argc, argv, "--log") || log_file.has_value(),
             log_file,
         });
+        // Opt-in model-load progress reporting (runtime.load.phase,
+        // <store>.weights.upload_progress). Default off so the log for
+        // existing downstream pipelines is unchanged.
+        if (const auto load_progress = find_arg(argc, argv, "--load-progress")) {
+            if (*load_progress != "0" && *load_progress != "1") {
+                throw std::runtime_error("--load-progress expects 0 or 1");
+            }
+            engine::core::set_load_progress_enabled(*load_progress == "1");
+        }
+        if (const auto cache_mb = find_arg(argc, argv, "--resample-kernel-cache-mb")) {
+            const int mb = parse_non_negative_int(*cache_mb, "--resample-kernel-cache-mb");
+            engine::audio::set_resample_kernel_cache_budget_bytes(static_cast<size_t>(mb) * 1024ull * 1024ull);
+        }
         const bool metrics_requested = has_arg(argc, argv, "--metrics");
         if (has_arg(argc, argv, "--version")) {
             minitts::app::print_build_info(std::cout);
@@ -651,6 +696,7 @@ int audiocpp_cli_main(int argc, char ** argv) {
         auto registry = engine::runtime::make_default_registry(
             registry_config ? std::optional<std::filesystem::path>(std::filesystem::path(*registry_config)) : std::nullopt);
         auto pipeline_registry = minitts::app::make_default_pipeline_registry();
+        auto recipe_registry = minitts::app::make_recipe_registry();
         const bool help_requested = has_arg(argc, argv, "--help");
         // Read before the command branches below. An option that no lookup ever runs for cannot
         // be told apart from a misspelling, which is what require_known_args rejects.
@@ -665,8 +711,21 @@ int audiocpp_cli_main(int argc, char ** argv) {
             }
             return 0;
         }
+        if (has_arg(argc, argv, "--list-recipes")) {
+            const auto ids = recipe_registry.ids();
+            std::cout << "registered_recipes=" << ids.size() << "\n";
+            for (const auto & id : ids) {
+                const auto & recipe = recipe_registry.require(id);
+                std::cout << id << "\t" << recipe.description() << "\n";
+            }
+            return 0;
+        }
         if (has_arg(argc, argv, "--list-devices")) {
-            engine::core::print_backend_devices(std::cout);
+            if (json_output) {
+                engine::core::print_backend_devices_json(std::cout);
+            } else {
+                engine::core::print_backend_devices(std::cout);
+            }
             return 0;
         }
         if (has_arg(argc, argv, "--list-loaders")) {
@@ -735,8 +794,29 @@ int audiocpp_cli_main(int argc, char ** argv) {
             return 0;
         }
 
+        auto common_session_options = collect_key_value_args(argc, argv, "--session-option");
+        if (const auto value = find_arg(argc, argv, "--moe-cpu-share")) {
+            const auto moe_cpu_share = engine::runtime::parse_finite_float_option({{"moe_cpu_share", *value}}, {"moe_cpu_share"}).value();
+            if (moe_cpu_share < 0 || moe_cpu_share > 1) throw std::runtime_error("--moe-cpu-share must be between zero and one");
+            common_session_options["moe_cpu_share"] = *value;
+        }
+        for (const auto & entry : {
+                 std::make_pair("--moe-policy", "moe_policy"),
+                 std::make_pair("--moe-disk-experts", "moe_disk_experts"),
+                 std::make_pair("--moe-pin-experts", "moe_pin_experts"),
+                 std::make_pair("--moe-expert-cache-size", "moe_expert_cache_size"),
+                 std::make_pair("--moe-disk-expert-read-threads", "moe_disk_expert_read_threads"),
+                 std::make_pair("--moe-cpu-expert-layers", "moe_cpu_expert_layers")}) {
+            if (const auto value = find_arg(argc, argv, entry.first)) {
+                if (common_session_options.count(entry.second))
+                    throw std::invalid_argument(std::string("duplicate shared MoE session option: ") + entry.second);
+                common_session_options[entry.second] = *value;
+            }
+        }
+
         const auto model_arg = find_arg(argc, argv, "--model");
         const auto pipeline_arg = find_arg(argc, argv, "--pipeline");
+        const auto recipe_arg = find_arg(argc, argv, "--recipe");
         // Read up front for the same reason as the options above.
         const auto workflow_inputs = collect_key_value_args(argc, argv, "--workflow-input");
         const auto audio_converter = find_arg(argc, argv, "--audio-converter").value_or("ffmpeg");
@@ -752,6 +832,7 @@ int audiocpp_cli_main(int argc, char ** argv) {
 #endif
             engine::core::BackendConfig backend;
             backend.type = parse_backend(find_arg(argc, argv, "--backend").value_or("cpu"));
+            backend.impl = find_arg(argc, argv, "--backend-impl").value_or("");
             backend.device = parse_int_arg(argc, argv, "--device", 0);
             backend.threads = threads;
             minitts::app::run_json_workflow(
@@ -762,11 +843,71 @@ int audiocpp_cli_main(int argc, char ** argv) {
                     backend,
                     optional_path_arg(argc, argv, "--out"),
                     collect_key_value_args(argc, argv, "--load-option"),
-                    collect_key_value_args(argc, argv, "--session-option"),
+                    common_session_options,
                     workflow_inputs,
                     optional_path_arg(argc, argv, "--model-spec-override"),
                     audio_converter,
                 });
+            return 0;
+        }
+        if (recipe_arg.has_value()) {
+            const auto policies = engine::runtime::resolve_moe_policies(common_session_options);
+            const auto prepared_policy = engine::moe::prepare_policy(policies);
+            for (const auto & option : common_session_options) {
+                const bool policy_key = option.first == "moe_policy" || option.first == "moe_cpu_share" ||
+                    option.first.rfind("moe_policy_params.", 0) == 0;
+                if (policy_key && !prepared_policy.active_placement && policies.eviction.name == "default") continue;
+                if (option.first.compare(0, 4, "moe_") == 0)
+                    throw std::runtime_error("recipes require role-scoped MoE options: --session-option <role>." + option.first + "=<value>");
+            }
+            const int threads = parse_int_arg(argc, argv, "--threads", 4);
+            if (threads <= 0) {
+                throw std::runtime_error("--threads must be positive");
+            }
+#ifdef _OPENMP
+            omp_set_num_threads(threads);
+#endif
+            minitts::app::CliRecipeOptions recipe_options;
+            for (const auto & [role, path] : collect_key_value_args(argc, argv, "--recipe-model")) {
+                recipe_options.model_paths.emplace(role, std::filesystem::path(path));
+            }
+            recipe_options.model_families = collect_key_value_args(argc, argv, "--recipe-family");
+            recipe_options.load_options = collect_key_value_args(argc, argv, "--load-option");
+            recipe_options.session_options = common_session_options;
+            recipe_options.model_spec_override = optional_path_arg(argc, argv, "--model-spec-override");
+            recipe_options.backend.type = parse_backend(find_arg(argc, argv, "--backend").value_or("cpu"));
+            recipe_options.backend.impl = find_arg(argc, argv, "--backend-impl").value_or("");
+            recipe_options.backend.device = parse_int_arg(argc, argv, "--device", 0);
+            recipe_options.backend.threads = threads;
+
+            auto request = build_request_from_cli(argc, argv);
+            const auto wav_options = wav_write_options_from_cli(argc, argv);
+            const auto audio_out = optional_path_arg(argc, argv, "--out");
+            const auto output_dir = optional_path_arg(argc, argv, "--out-dir");
+            const auto text_out = optional_path_arg(argc, argv, "--text-out");
+            require_known_args(argc, argv);
+
+            minitts::app::CliRecipeModelExecutor executor(registry, std::move(recipe_options));
+            const auto started = std::chrono::steady_clock::now();
+            auto result = recipe_registry.require(*recipe_arg).run(executor, request);
+            const double wall_ms = duration_ms(std::chrono::steady_clock::now() - started);
+            engine::debug::timing_log_scalar("session.wall_ms", wall_ms);
+            std::cout << "recipe=" << *recipe_arg << "\n";
+            minitts::app::emit_task_result(
+                result,
+                audio_out,
+                output_dir,
+                output_dir,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt,
+                wav_options);
+            if (text_out.has_value()) {
+                write_text_output(result, *text_out, "text_out");
+            }
+            if (metrics_requested) {
+                minitts::app::emit_task_metrics(result, audio_metrics_info(request), wall_ms);
+            }
             return 0;
         }
         if (help_requested && !model_arg.has_value()) {
@@ -825,6 +966,7 @@ int audiocpp_cli_main(int argc, char ** argv) {
 
         engine::runtime::SessionOptions session_options;
         session_options.backend.type = parse_backend(find_arg(argc, argv, "--backend").value_or("cpu"));
+        session_options.backend.impl = find_arg(argc, argv, "--backend-impl").value_or("");
         session_options.backend.device = parse_int_arg(argc, argv, "--device", 0);
         const int threads = parse_int_arg(argc, argv, "--threads", 4);
         if (threads <= 0) {
@@ -834,11 +976,14 @@ int audiocpp_cli_main(int argc, char ** argv) {
 #ifdef _OPENMP
         omp_set_num_threads(threads);
 #endif
-        session_options.options = collect_key_value_args(argc, argv, "--session-option");
+        session_options.options = common_session_options;
         // Parsed before the model loads so a bad value fails fast.
         const auto wav_options = wav_write_options_from_cli(argc, argv);
         auto model = registry.load(load_request);
         auto session = model->create_task_session(task_spec, session_options);
+        // The weight stores uploaded during session construction: close the
+        // load-progress bracket opened by registry.load (see finish_model_load_trace).
+        engine::runtime::finish_model_load_trace();
         const auto voice_state_out = optional_path_arg(argc, argv, "--voice-state-out");
         const auto text_out = optional_path_arg(argc, argv, "--text-out");
         const auto words_out = optional_path_arg(argc, argv, "--words-out");
@@ -932,18 +1077,14 @@ int audiocpp_cli_main(int argc, char ** argv) {
             request.options["return_timestamps"] = "true";
         }
         if (voice_state_out.has_value()) {
-            if (session->family() != "pocket_tts") {
-                throw std::runtime_error("--voice-state-out is only supported by PocketTTS");
-            }
-            if (task_spec.task != engine::runtime::VoiceTaskKind::Tts) {
-                throw std::runtime_error("--voice-state-out requires --task tts");
-            }
-            request.options["pocket_tts.export_voice_state_path"] = voice_state_out->string();
+            request.options["export_voice_state_file"] = voice_state_out->string();
         }
         require_known_args(argc, argv);
         const auto session_start = std::chrono::steady_clock::now();
         session->prepare(engine::runtime::build_preparation_request(request));
         if (voice_state_out.has_value()) {
+            engine::debug::timing_log_scalar(
+                "session.wall_ms", duration_ms(std::chrono::steady_clock::now() - session_start));
             std::cout << "family=" << session->family() << "\n";
             std::cout << "voice_state_out=" << voice_state_out->string() << "\n";
             return 0;
@@ -1000,15 +1141,24 @@ int audiocpp_cli_main(int argc, char ** argv) {
 int wmain(int argc, wchar_t ** wargv) {
     try {
         auto utf8_args = wide_args_to_utf8(argc, wargv);
-        std::vector<char *> argv;
-        argv.reserve(utf8_args.size() + 1);
+        std::vector<char *> utf8_argv;
+        utf8_argv.reserve(utf8_args.size() + 1);
         for (auto & arg : utf8_args) {
+            utf8_argv.push_back(arg.data());
+        }
+        utf8_argv.push_back(nullptr);
+
+        auto expanded_args = minitts::cli::expand_cli_args(argc, utf8_argv.data());
+        std::vector<char *> argv;
+        argv.reserve(expanded_args.size() + 1);
+        for (auto & arg : expanded_args) {
             argv.push_back(arg.data());
         }
         argv.push_back(nullptr);
-        const int status = audiocpp_cli_main(argc, argv.data());
-        if (status == 0 && !minitts::cli::has_arg(argc, argv.data(), "--version")) {
-            minitts::cli::warn_ignored_args(argc, argv.data());
+        const int expanded_argc = static_cast<int>(expanded_args.size());
+        const int status = audiocpp_cli_main(expanded_argc, argv.data());
+        if (status == 0 && !minitts::cli::has_arg(expanded_argc, argv.data(), "--version")) {
+            minitts::cli::warn_ignored_args(expanded_argc, argv.data());
         }
         return status;
     } catch (const std::exception & ex) {
@@ -1018,10 +1168,23 @@ int wmain(int argc, wchar_t ** wargv) {
 }
 #else
 int main(int argc, char ** argv) {
-    const int status = audiocpp_cli_main(argc, argv);
-    if (status == 0 && !minitts::cli::has_arg(argc, argv, "--version")) {
-        minitts::cli::warn_ignored_args(argc, argv);
+    try {
+        auto expanded_args = minitts::cli::expand_cli_args(argc, argv);
+        std::vector<char *> expanded_argv;
+        expanded_argv.reserve(expanded_args.size() + 1);
+        for (auto & arg : expanded_args) {
+            expanded_argv.push_back(arg.data());
+        }
+        expanded_argv.push_back(nullptr);
+        const int expanded_argc = static_cast<int>(expanded_args.size());
+        const int status = audiocpp_cli_main(expanded_argc, expanded_argv.data());
+        if (status == 0 && !minitts::cli::has_arg(expanded_argc, expanded_argv.data(), "--version")) {
+            minitts::cli::warn_ignored_args(expanded_argc, expanded_argv.data());
+        }
+        return status;
+    } catch (const std::exception & ex) {
+        std::cerr << "audiocpp_cli failed: " << ex.what() << "\n";
+        return 1;
     }
-    return status;
 }
 #endif

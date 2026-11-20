@@ -63,11 +63,11 @@ struct SupertonicChunkOutput {
     float duration_seconds = 0.0F;
 };
 
-constexpr size_t kSupertonicDurationArenaBytes = 256ull * 1024ull * 1024ull;
-constexpr size_t kSupertonicTextArenaBytes = 1024ull * 1024ull * 1024ull;
+constexpr size_t kSupertonicDurationArenaBytes = 16ull * 1024ull * 1024ull;
+constexpr size_t kSupertonicTextArenaBytes = 16ull * 1024ull * 1024ull;
 constexpr size_t kSupertonicVectorArenaBytes = 32ull * 1024ull * 1024ull;
-constexpr size_t kSupertonicVocoderArenaBytes = 2048ull * 1024ull * 1024ull;
-constexpr size_t kSupertonicIoArenaBytes = 64ull * 1024ull * 1024ull;
+constexpr size_t kSupertonicVocoderArenaBytes = 16ull * 1024ull * 1024ull;
+constexpr size_t kSupertonicIoArenaBytes = 16ull * 1024ull * 1024ull;
 constexpr int kSupertonicVectorStepsPerGraph = 1;
 constexpr size_t kSupertonicSmallGraphCacheSlots = 4;
 constexpr size_t kSupertonicLargeGraphCacheSlots = 2;
@@ -334,7 +334,7 @@ std::shared_ptr<const SupertonicBackendWeights> load_backend_weights(
         backend,
         backend_type,
         "supertonic.weights",
-        64ull * 1024ull * 1024ull);
+        8ull * 1024ull * 1024ull);
     const auto tensors = assets->weights->tensors();
     weights->tensors.reserve(tensors.size());
     for (const auto & metadata : tensors) {
@@ -498,18 +498,6 @@ core::TensorValue edge_pad_time(
         out = modules::ConcatModule({2}).build(ctx, out, edge);
     }
     return out;
-}
-
-core::TensorValue prelu(
-    core::ModuleBuildContext & ctx,
-    const core::TensorValue & input,
-    const core::TensorValue & slope) {
-    auto x = core::ensure_backend_addressable_layout(ctx, input);
-    auto positive = core::wrap_tensor(ggml_relu(ctx.ggml, x.tensor), input.shape, GGML_TYPE_F32);
-    auto negative = core::wrap_tensor(ggml_sub(ctx.ggml, x.tensor, positive.tensor), input.shape, GGML_TYPE_F32);
-    auto slope_repeated = broadcast_to(ctx, slope, input.shape);
-    auto scaled_negative = core::wrap_tensor(ggml_mul(ctx.ggml, negative.tensor, slope_repeated.tensor), input.shape, GGML_TYPE_F32);
-    return core::wrap_tensor(ggml_add(ctx.ggml, positive.tensor, scaled_negative.tensor), input.shape, GGML_TYPE_F32);
 }
 
 core::TensorValue batch_norm_eval(
@@ -683,6 +671,8 @@ private:
         ggml_set_output(prepared->output);
         prepared->graph = ggml_new_graph_custom(ctx.ggml, 65536, false);
         ggml_build_forward_expand(prepared->graph, prepared->output);
+        debug::timing_log_context_reservation("supertonic.vocoder.graph", prepared->ggml.get());
+        debug::timing_log_context_reservation("supertonic.vocoder.io", prepared->io_ggml.get());
         prepared->io_buffer = ggml_backend_alloc_ctx_tensors(prepared->io_ggml.get(), backend_);
         if (prepared->io_buffer == nullptr) {
             throw std::runtime_error("failed to allocate Supertonic vocoder IO buffer");
@@ -749,7 +739,7 @@ private:
             1,
             true,
         }).build(ctx, x, {weights_.head1_weight, weights_.head1_bias});
-        x = prelu(ctx, x, weights_.head_prelu_slope);
+        x = modules::PReluModule().build(ctx, x, weights_.head_prelu_slope);
         x = modules::Conv1dModule({
             x.shape.dims[1],
             weights_.head2_weight.shape.dims[0],
@@ -832,7 +822,8 @@ public:
             ctx_,
             joined,
             {weight("duration_predictor.tts.dp.predictor.layers.0.weight"), weight("duration_predictor.tts.dp.predictor.layers.0.bias")});
-        h = prelu(ctx_, h, weight("duration_predictor.tts.dp.predictor.activation.weight"));
+        h = modules::PReluModule().build(ctx_, h,
+            weight("duration_predictor.tts.dp.predictor.activation.weight"));
         auto duration = modules::LinearModule({
             h.shape.last_dim(),
             weight("duration_predictor.tts.dp.predictor.layers.1.weight").shape.dims[0],
@@ -1782,6 +1773,8 @@ private:
         ggml_set_output(graph->output);
         graph->graph = ggml_new_graph_custom(ctx.ggml, 65536, false);
         ggml_build_forward_expand(graph->graph, graph->output);
+        debug::timing_log_context_reservation("supertonic.duration_predictor.graph", graph->ggml.get());
+        debug::timing_log_context_reservation("supertonic.duration_predictor.io", graph->io_ggml.get());
         graph->io_buffer = ggml_backend_alloc_ctx_tensors(graph->io_ggml.get(), backend_);
         if (graph->io_buffer == nullptr) {
             throw std::runtime_error("failed to allocate Supertonic duration predictor IO buffer");
@@ -1953,6 +1946,8 @@ private:
         ggml_set_output(graph->output);
         graph->graph = ggml_new_graph_custom(ctx.ggml, 65536, false);
         ggml_build_forward_expand(graph->graph, graph->output);
+        debug::timing_log_context_reservation("supertonic.text_encoder.graph", graph->ggml.get());
+        debug::timing_log_context_reservation("supertonic.text_encoder.io", graph->io_ggml.get());
         graph->io_buffer = ggml_backend_alloc_ctx_tensors(graph->io_ggml.get(), backend_);
         if (graph->io_buffer == nullptr) {
             throw std::runtime_error("failed to allocate Supertonic text encoder IO buffer");
@@ -2203,6 +2198,8 @@ private:
         ggml_set_output(graph->output);
         graph->graph = ggml_new_graph_custom(ctx.ggml, 262144, false);
         ggml_build_forward_expand(graph->graph, graph->output);
+        debug::timing_log_context_reservation("supertonic.vector_estimator.graph", graph->ggml.get());
+        debug::timing_log_context_reservation("supertonic.vector_estimator.io", graph->io_ggml.get());
         graph->io_buffer = ggml_backend_alloc_ctx_tensors(graph->io_ggml.get(), backend_);
         if (graph->io_buffer == nullptr) {
             throw std::runtime_error("failed to allocate Supertonic vector estimator IO buffer");
