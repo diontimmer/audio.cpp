@@ -113,9 +113,10 @@ std::unordered_map<std::string, ZipEntry> read_zip_entries(const std::vector<uin
 enum class GlobalKind { None, OrderedDict, RebuildTensor, StorageF32, StorageF16, StorageBF16 };
 
 struct PickleValue {
-    enum class Kind { None, Int, Bool, Str, Tuple, List, Global, Storage, Tensor, Dict } kind = Kind::None;
+    enum class Kind { None, Int, Bool, Float, Str, Tuple, List, Global, Storage, Tensor, Dict } kind = Kind::None;
     int64_t integer = 0;
     bool boolean = false;
+    double real = 0.0;
     std::string text;
     std::vector<PickleValue> items;
     GlobalKind global = GlobalKind::None;
@@ -185,10 +186,15 @@ public:
             case 0x8a:
                 push(int_value(read_long1()));
                 break;
+            case 'G':
+                push(float_value(read_f64be()));
+                break;
             case 'X':
+            case 'B':  // BINBYTES; bytes values only appear in metadata and are kept as text.
                 push(str_value(read_bytes(read_u32())));
                 break;
             case 0x8c:
+            case 'C':  // SHORT_BINBYTES
                 push(str_value(read_bytes(read_byte())));
                 break;
             case 'c':
@@ -229,6 +235,9 @@ public:
                 break;
             case 'j':
                 op_get(read_u32());
+                break;
+            case 0x94:  // MEMOIZE (protocol 4+)
+                op_put(memo_.size());
                 break;
             case 'Q':
                 op_persid();
@@ -272,6 +281,12 @@ private:
         PickleValue value;
         value.kind = PickleValue::Kind::Bool;
         value.boolean = v;
+        return value;
+    }
+    static PickleValue float_value(double v) {
+        PickleValue value;
+        value.kind = PickleValue::Kind::Float;
+        value.real = v;
         return value;
     }
     static PickleValue str_value(std::string v) {
@@ -320,6 +335,17 @@ private:
     }
     int32_t read_i32() {
         return static_cast<int32_t>(read_u32());
+    }
+    double read_f64be() {
+        expect(8);
+        uint64_t bits = 0;
+        for (size_t i = 0; i < 8; ++i) {
+            bits = bits << 8 | data_[cursor_ + i];
+        }
+        cursor_ += 8;
+        double value = 0.0;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
     }
     int64_t read_long1() {
         const uint8_t length = read_byte();
@@ -605,14 +631,6 @@ std::string require_string_metadata(const PickleValue & dict, std::string_view k
     return value->text;
 }
 
-int require_int_metadata(const PickleValue & dict, std::string_view key) {
-    const auto * value = dict_find(dict, key);
-    if (value == nullptr || value->kind != PickleValue::Kind::Int) {
-        throw std::runtime_error("RVC voice checkpoint missing integer metadata: " + std::string(key));
-    }
-    return static_cast<int>(value->integer);
-}
-
 int sample_rate_from_checkpoint(const PickleValue & dict) {
     if (const auto * config = dict_find(dict, "config");
         config != nullptr && config->kind == PickleValue::Kind::List && !config->items.empty()) {
@@ -620,6 +638,10 @@ int sample_rate_from_checkpoint(const PickleValue & dict) {
         if (last.kind == PickleValue::Kind::Int && last.integer > 0) {
             return static_cast<int>(last.integer);
         }
+    }
+    // Applio stores sr as an integer (40000); classic RVC stores "40k".
+    if (const auto * sr = dict_find(dict, "sr"); sr != nullptr && sr->kind == PickleValue::Kind::Int && sr->integer > 0) {
+        return static_cast<int>(sr->integer);
     }
     const auto sr = require_string_metadata(dict, "sr");
     if (sr == "32k") {
@@ -657,7 +679,14 @@ public:
             version != nullptr && version->kind == PickleValue::Kind::Str) {
             version_ = version->text;
         }
-        has_f0_ = require_int_metadata(root, "f0") != 0;
+        // Applio and some forks train other vocoders whose dec.* layout this synthesizer cannot run.
+        if (const auto * vocoder = dict_find(root, "vocoder");
+            vocoder != nullptr && vocoder->kind == PickleValue::Kind::Str && vocoder->text != "HiFi-GAN") {
+            throw std::runtime_error("only HiFi-GAN vocoder RVC models are supported; checkpoint uses " +
+                                     vocoder->text + ": " + path_.string());
+        }
+        // The f0 metadata flag is an int in classic RVC and a bool in Applio; pitch guidance is read from
+        // the presence of enc_p.emb_pitch.weight instead, which both formats agree on.
         sample_rate_ = sample_rate_from_checkpoint(root);
         PickleValue * weights = dict_find(root, "weight");
         if (weights == nullptr || weights->kind != PickleValue::Kind::Dict) {
@@ -690,6 +719,7 @@ public:
             record.byte_offset = storage->second.offset + storage_offset;
             records_.emplace(std::move(key.text), std::move(record));
         }
+        has_f0_ = has_tensor("enc_p.emb_pitch.weight");
         if (version_.empty()) {
             const auto phone = records_.find("enc_p.emb_phone.weight");
             if (phone == records_.end() || phone->second.shape.size() != 2) {
